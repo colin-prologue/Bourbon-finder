@@ -1,0 +1,70 @@
+# GitHub Actions scheduling for nc-bourbon-finder.
+#
+# NOTE ON STATE: each poll needs the SQLite DB from the previous run. This
+# workflow commits ncbourbon.db back to the repo after each run — simple and
+# adequate for a single-user tool (DB is a few MB). If you outgrow that,
+# switch to actions/cache or run on a VPS/Raspberry Pi with plain cron
+# (crontab example in the README).
+#
+# NOTE ON CADENCE: GitHub Actions cron is best-effort and can lag several
+# minutes at busy times — fine for this use. The stocks feed refreshes every
+# 15 min; we poll every 20 to stay comfortably under it.
+#
+# Secrets to set (repo Settings -> Secrets and variables -> Actions):
+#   NCBOURBON_SMTP_PASSWORD  — SMTP/App password for the alert mailbox
+
+name: poll
+on:
+  schedule:
+    - cron: "*/20 * * * *"   # stocks differ (~every 20 min)
+    - cron: "13 10,15,20 * * *"  # shipments + wake, 3x/day (UTC)
+    - cron: "7 9 * * *"      # catalog + digest, daily 9:07 UTC (~5am ET)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: poll
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Decide what to run
+        id: which
+        run: |
+          MIN=$(date -u +%M); HOUR=$(date -u +%H)
+          echo "stocks=true" >> "$GITHUB_OUTPUT"
+          if [ "$MIN" -ge 10 ] && [ "$MIN" -lt 30 ] && { [ "$HOUR" = "10" ] || [ "$HOUR" = "15" ] || [ "$HOUR" = "20" ]; }; then
+            echo "boards=true" >> "$GITHUB_OUTPUT"; fi
+          if [ "$HOUR" = "09" ] && [ "$MIN" -lt 20 ]; then
+            echo "daily=true" >> "$GITHUB_OUTPUT"; fi
+      - name: Poll warehouse stocks
+        env: { NCBOURBON_SMTP_PASSWORD: "${{ secrets.NCBOURBON_SMTP_PASSWORD }}" }
+        run: python -m ncbourbon poll-stocks
+      - name: Poll shipments + Wake
+        if: steps.which.outputs.boards == 'true'
+        env: { NCBOURBON_SMTP_PASSWORD: "${{ secrets.NCBOURBON_SMTP_PASSWORD }}" }
+        run: |
+          python -m ncbourbon poll-shipments
+          python -m ncbourbon poll-wake
+      - name: Daily catalog + digest
+        if: steps.which.outputs.daily == 'true'
+        env: { NCBOURBON_SMTP_PASSWORD: "${{ secrets.NCBOURBON_SMTP_PASSWORD }}" }
+        run: |
+          python -m ncbourbon poll-catalog
+          python -m ncbourbon digest
+      - name: Commit DB state
+        run: |
+          git config user.name "ncbourbon-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add ncbourbon.db
+          git diff --cached --quiet || git commit -m "db: poll $(date -u +%FT%TZ)"
+          git push

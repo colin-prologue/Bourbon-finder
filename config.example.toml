@@ -1,0 +1,34 @@
+# nc-bourbon-finder configuration
+# Copy to config.toml and edit. SMTP password goes in the
+# NCBOURBON_SMTP_PASSWORD environment variable, never in this file.
+
+[general]
+db_path = "ncbourbon.db"
+# Identify yourself politely — include a contact address.
+user_agent = "nc-bourbon-finder/0.1 (personal hobby tool; contact: colin@prologuegames.com)"
+request_timeout = 60
+
+[alerts]
+smtp_host = "smtp.gmail.com"
+smtp_port = 587
+smtp_user = "your.address@gmail.com"     # for Gmail use an App Password
+from_addr = "your.address@gmail.com"
+to_addrs = ["colin@prologuegames.com"]
+cooldown_hours = 6.0                      # suppress duplicate alerts within this window
+
+[watch]
+# Instant alerts fire only for these Listing Types (your chosen scope).
+listing_types = ["Allocation", "Limited"]
+# Optional: names matching these regexes alert even if flagged "Listed" or "Barrel".
+name_patterns = ["Pappy", "Van Winkle", "Antique Collection", "William Larue", "George T. Stagg"]
+# Alert when Total Available drops by this fraction between polls (boards ordering).
+drawdown_alert_fraction = 0.5
+
+[wake]
+enabled = true
+# Search terms POSTed to Wake ABC a few times a day (their data refreshes ~2x/day).
+search_terms = ["blanton", "weller", "eh taylor", "eagle rare", "stagg", "van winkle", "old fitzgerald", "elmer", "michter", "elijah craig barrel proof"]
+
+[boards]
+# StockShipped alerts fire only for boards matching these substrings (empty = all boards).
+watch_boards = ["Wake", "Durham", "Mecklenburg", "Orange", "Chapel Hill"]
