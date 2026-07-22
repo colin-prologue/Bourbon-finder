@@ -48,6 +48,14 @@ def fetch(
             # callers detect that via parsers. Here we only retry transport/5xx.
             if resp.status_code >= 500:
                 raise requests.HTTPError(f"HTTP {resp.status_code}", response=resp)
+            if resp.status_code != 200:
+                # 403 here usually means a WAF is blocking this IP range
+                # (e.g. cloud/datacenter IPs like GitHub Actions runners).
+                log.warning(
+                    "HTTP %s from %s (%d bytes) — if this is 403 from a cloud "
+                    "runner, the site is likely blocking datacenter IPs",
+                    resp.status_code, url, len(resp.content),
+                )
             return resp
         except requests.RequestException as exc:  # includes HTTPError above
             last_exc = exc

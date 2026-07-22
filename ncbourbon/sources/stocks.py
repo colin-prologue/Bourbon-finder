@@ -68,6 +68,13 @@ def fetch_stock_report(session, report_date: date | None = None, brand: str = ""
     return resp.text
 
 
+def _page_snippet(soup: BeautifulSoup, limit: int = 300) -> str:
+    """Short plain-text excerpt of a page, for diagnosable error messages
+    (reveals WAF block pages, maintenance notices, redirects, etc.)."""
+    text = soup.get_text(" ", strip=True)
+    return text[:limit]
+
+
 def parse_stock_report(html: str) -> list[StockRow]:
     soup = BeautifulSoup(html, "lxml")
     title = (soup.title.get_text(strip=True) if soup.title else "")
@@ -86,7 +93,10 @@ def parse_stock_report(html: str) -> list[StockRow]:
             detail_table = table
             break
     if detail_table is None:
-        raise SchemaDriftError("No table with a 'Listing Type' header found")
+        raise SchemaDriftError(
+            "No table with a 'Listing Type' header found. "
+            f"Page title: {title!r}. Page text starts: {_page_snippet(soup)!r}"
+        )
 
     rows: list[StockRow] = []
     for tr in detail_table.find_all("tr")[1:]:

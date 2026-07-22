@@ -55,6 +55,7 @@ def cmd_poll_stocks(conn, cfg, session):
         html = stocks.fetch_stock_report(session, timeout=cfg.request_timeout)
         rows = stocks.parse_stock_report(html)
     except Exception as exc:  # noqa: BLE001 — record and alert on repeated failure
+        log.error("poll-stocks failed: %s", exc, exc_info=True)
         _health(conn, cfg, "stocks", False, str(exc))
         raise SystemExit(1)
     _health(conn, cfg, "stocks", True)
