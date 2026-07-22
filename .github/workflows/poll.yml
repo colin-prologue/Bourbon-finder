@@ -49,12 +49,13 @@ jobs:
       - name: Poll warehouse stocks
         env: { NCBOURBON_SMTP_PASSWORD: "${{ secrets.NCBOURBON_SMTP_PASSWORD }}" }
         run: python -m ncbourbon poll-stocks
-      - name: Poll shipments + Wake
+      - name: Poll boards (ABC/GO + Durham + Wake)
         if: steps.which.outputs.boards == 'true'
         env: { NCBOURBON_SMTP_PASSWORD: "${{ secrets.NCBOURBON_SMTP_PASSWORD }}" }
         run: |
-          python -m ncbourbon poll-shipments
+          python -m ncbourbon poll-boards
           python -m ncbourbon poll-wake
+          python -m ncbourbon poll-shipments   # liveness ping only (StockShipped retired)
       - name: Daily catalog + digest
         if: steps.which.outputs.daily == 'true'
         env: { NCBOURBON_SMTP_PASSWORD: "${{ secrets.NCBOURBON_SMTP_PASSWORD }}" }
