@@ -37,13 +37,15 @@ def fetch(
     url: str,
     *,
     data: dict | None = None,
+    json: dict | None = None,
+    headers: dict | None = None,
     timeout: int = 60,
 ) -> requests.Response:
     """GET/POST with retries. Raises requests.RequestException after retries."""
     last_exc: Exception | None = None
     for attempt in range(MAX_RETRIES):
         try:
-            resp = session.request(method, url, data=data, timeout=timeout)
+            resp = session.request(method, url, data=data, json=json, headers=headers, timeout=timeout)
             # NC ABC serves error pages with HTTP 200 and title "Server Error";
             # callers detect that via parsers. Here we only retry transport/5xx.
             if resp.status_code >= 500:

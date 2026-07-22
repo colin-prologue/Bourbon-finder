@@ -44,7 +44,14 @@ class WakeConfig:
 
 @dataclass
 class BoardsConfig:
-    watch_boards: list[str] = field(default_factory=list)
+    watch_boards: list[str] = field(default_factory=list)  # legacy: StockShipped (retired 2026-07)
+    # ABC/GO board subdomains to poll for store-level inventory (e.g. "nh").
+    abcgo_boards: list[str] = field(default_factory=lambda: ["nh"])
+    # Search terms POSTed to each board's inventory API. Empty -> derived from
+    # the live Allocation/Limited warehouse watchlist at run time.
+    search_terms: list[str] = field(default_factory=list)
+    # Durham County ABC (its own site durhamabc.com, not on ABC/GO).
+    durham: bool = True
 
 
 @dataclass
@@ -90,5 +97,10 @@ def load_config(path: str | None = None) -> Config:
         search_terms=list(wk.get("search_terms", [])),
     )
     b = data.get("boards", {})
-    cfg.boards = BoardsConfig(watch_boards=list(b.get("watch_boards", [])))
+    cfg.boards = BoardsConfig(
+        watch_boards=list(b.get("watch_boards", [])),
+        abcgo_boards=list(b.get("abcgo_boards", ["nh"])),
+        search_terms=list(b.get("search_terms", [])),
+        durham=b.get("durham", True),
+    )
     return cfg

@@ -62,6 +62,23 @@ ERROR_HTML = """<!DOCTYPE html>
 <html><head><title>Server Error - NC ABC Commission</title></head>
 <body><h1>Page Not Found</h1><p>We apologize but the page you are looking for is no longer available.</p></body></html>"""
 
+# Schema transcribed verbatim by three independent verifier agents from the
+# live page on 2026-07-21 (the endpoint has been erroring since that evening,
+# so this fixture is the reference for when it recovers).
+STOCKSHIPPED_HTML = """<!DOCTYPE html>
+<html><head><title>Stock Shipped - NC ABC Commission</title></head><body>
+<form action="/Search/StockShipped" method="post">
+  <select name="BoardId"><option value="">All Boards</option></select>
+  <select name="ProductId"><option value="">All Products</option></select>
+</form>
+<table class="table table-bordered table-striped">
+  <tr><th>Number of Bottles Shipped</th><th>NC Code</th><th>Product Name</th><th>Board Name</th></tr>
+  <tr><td>72</td><td>27090</td><td>Blanton's Single Barrel</td><td>Wake County ABC Board</td></tr>
+  <tr><td>12</td><td>17286</td><td>Old Fitzgerald BIB 10Y Spring 26 Decanter</td><td>Durham County ABC Board</td></tr>
+  <tr><td>1,440</td><td>00504</td><td>Tito's Handmade Vodka</td><td>Mecklenburg County ABC Board</td></tr>
+</table>
+</body></html>"""
+
 
 def make_xlsx(path: Path):
     """Mirrors the real file parsed in-browser 2026-07-21: A1:B252 grid,
@@ -85,5 +102,6 @@ if __name__ == "__main__":
     (HERE / "stocks_sample.html").write_text(STOCKS_HTML)
     (HERE / "wake_sample.html").write_text(WAKE_HTML)
     (HERE / "error_page.html").write_text(ERROR_HTML)
+    (HERE / "stockshipped_sample.html").write_text(STOCKSHIPPED_HTML)
     make_xlsx(HERE / "allocated_sample.xlsx")
     print("fixtures written")

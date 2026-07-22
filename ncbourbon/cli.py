@@ -1,7 +1,8 @@
 """Command-line entry points.
 
   python -m ncbourbon poll-stocks     # every 15 min  (state warehouse differ)
-  python -m ncbourbon poll-shipments  # a few times/day (StockShipped watcher)
+  python -m ncbourbon poll-shipments  # DEPRECATED liveness ping (StockShipped retired)
+  python -m ncbourbon poll-boards     # a few times/day (ABC/GO per-store board inventory)
   python -m ncbourbon poll-catalog    # daily (Special Items, new items, xlsx)
   python -m ncbourbon poll-wake       # 2-4x/day (Wake ABC store inventory)
   python -m ncbourbon digest          # daily summary email
@@ -17,6 +18,7 @@ from .alerts import alert, send_digest
 from .config import load_config
 from .db import connect, now_iso, record_health
 from .diff import (
+    apply_board_snapshot,
     apply_catalog_items,
     apply_shipments,
     apply_stock_snapshot,
@@ -24,7 +26,7 @@ from .diff import (
 )
 from .http import make_session
 from .sources import catalog as catalog_mod
-from .sources import stock_shipped, stocks, wake
+from .sources import abcgo, durham, stock_shipped, stocks, wake
 
 log = logging.getLogger("ncbourbon")
 
@@ -62,36 +64,71 @@ def cmd_poll_stocks(conn, cfg, session):
 
 
 def cmd_poll_shipments(conn, cfg, session):
-    form = None
+    """DEPRECATED liveness check. StockShipped (the warehouse->board shipment
+    report) was RETIRED by NC ABC — confirmed 2026-07-22: the route returns the
+    app's "no longer available" page and is gone from the site nav. The board
+    leg now lives in `poll-boards` (ABC/GO per-store inventory). We keep a cheap
+    ping here only so we learn if the state ever restores the shipment feed."""
     try:
         form = stock_shipped.discover_form(session, timeout=cfg.request_timeout)
     except Exception as exc:  # noqa: BLE001
         _health(conn, cfg, "stock_shipped", False, str(exc))
         return
     if form is None:
-        _health(conn, cfg, "stock_shipped", False, "error page or no form (known-intermittent)")
+        _health(conn, cfg, "stock_shipped", False,
+                "retired: endpoint serves 'no longer available' (board leg = poll-boards)")
+        log.info("poll-shipments: StockShipped still retired; use poll-boards for the board leg")
         return
+    # If we ever get here, the state brought the feed back — worth a heads-up.
     _health(conn, cfg, "stock_shipped", True)
-    log.info(
-        "StockShipped form discovered: action=%s fields=%s boards=%d",
-        form.action, list(form.fields), len(form.board_options),
-    )
-    # Submit with defaults (= All Boards / All Products) and parse whatever returns.
-    from .http import fetch as _fetch
+    log.warning("StockShipped appears RESTORED (%d boards) — shipment parsing could be re-enabled",
+                len(form.board_options))
 
-    action = form.action if form.action.startswith("http") else "https://abc2.nc.gov" + form.action
-    resp = _fetch(session, "POST", action, data=form.fields, timeout=cfg.request_timeout)
-    rows = stock_shipped.parse_shipments(resp.text)
-    watch_codes = {
-        r["nc_code"]
-        for r in conn.execute(
-            "SELECT nc_code FROM stock_latest WHERE listing_type IN ('Allocation','Limited') "
-            "UNION SELECT nc_code FROM allocated_list"
-        ).fetchall()
-    }
-    events = apply_shipments(conn, rows, watch_codes, cfg.boards.watch_boards)
+
+def _watchlist_terms(conn, limit: int = 80) -> list[str]:
+    """Search terms for the board APIs, derived from the live Allocation/Limited
+    warehouse watchlist: first two words of each brand (a good substring filter
+    for the boards' inventory search)."""
+    terms = set()
+    for r in conn.execute(
+        "SELECT DISTINCT brand_name FROM stock_latest "
+        "WHERE listing_type IN ('Allocation','Limited')"
+    ).fetchall():
+        name = (r["brand_name"] or "").strip()
+        if name:
+            terms.add(" ".join(name.split()[:2]))
+    return sorted(terms)[:limit]
+
+
+def cmd_poll_boards(conn, cfg, session):
+    """Board leg: poll each ABC/GO board's public per-store inventory API for the
+    hot watchlist, emitting board_restock (on-shelf) alerts. Stage B of the
+    two-stage model — stage A is poll-stocks (warehouse arrival)."""
+    terms = list(cfg.boards.search_terms) or _watchlist_terms(conn)
+    if not terms:
+        log.info("poll-boards: empty watchlist and no configured search_terms; run poll-stocks first")
+        return
+    all_rows = []
+    for board in cfg.boards.abcgo_boards:
+        ok, err = True, ""
+        try:
+            all_rows.extend(abcgo.fetch_board_stock(session, board, terms, timeout=cfg.request_timeout))
+        except Exception as exc:  # noqa: BLE001
+            ok, err = False, f"{board}: {exc}"
+            log.warning("abcgo board %s failed: %s", board, exc, exc_info=True)
+        _health(conn, cfg, f"abcgo:{board}", ok, err)
+    if cfg.boards.durham:
+        ok, err = True, ""
+        try:
+            all_rows.extend(durham.fetch_durham_stock(session, terms, timeout=cfg.request_timeout))
+        except Exception as exc:  # noqa: BLE001
+            ok, err = False, str(exc)
+            log.warning("durham board failed: %s", exc, exc_info=True)
+        _health(conn, cfg, "durham", ok, err)
+    events = apply_board_snapshot(conn, all_rows)
     _emit(conn, cfg, events)
-    log.info("shipments: %d rows, %d events", len(rows), len(events))
+    log.info("boards: %d store-rows across %d board(s), %d events",
+             len(all_rows), len(cfg.boards.abcgo_boards), len(events))
 
 
 def cmd_poll_catalog(conn, cfg, session):
@@ -167,6 +204,72 @@ def cmd_poll_wake(conn, cfg, session):
     log.info("wake: %d store-rows, %d events", len(seen), len(events))
 
 
+def cmd_backfill(conn, cfg, session, days: int, delay: float):
+    """Pull historical daily warehouse stock reports (the ReportDate field
+    accepts past dates). One polite request per missing day, oldest first.
+    How far back the state serves reports is undocumented — empty days are
+    logged and skipped, so the command discovers the archive's depth."""
+    import time as _time
+    from datetime import timedelta
+
+    have = {
+        r["report_date"]
+        for r in conn.execute("SELECT DISTINCT report_date FROM warehouse_snapshot").fetchall()
+    }
+    pulled = empty = 0
+    for i in range(days, 0, -1):
+        d = stocks.nc_today() - timedelta(days=i)
+        if d.isoformat() in have:
+            continue
+        try:
+            rows = stocks.parse_stock_report(
+                stocks.fetch_stock_report(session, d, timeout=cfg.request_timeout)
+            )
+        except stocks.SchemaDriftError as exc:
+            if "zero rows" in str(exc):
+                empty += 1
+                log.info("no report for %s (before archive start, or holiday)", d)
+                _time.sleep(delay)
+                continue
+            raise
+        ts = f"{d.isoformat()}T00:00:00Z"  # synthetic, one snapshot per day
+        for row in rows:
+            conn.execute(
+                "INSERT OR REPLACE INTO warehouse_snapshot VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    row.nc_code, row.brand_name, row.listing_type, row.total_available,
+                    row.size, row.cases_per_pallet, row.supplier, row.supplier_allotment,
+                    row.broker, d.isoformat(), ts,
+                ),
+            )
+        conn.commit()
+        pulled += 1
+        log.info("backfilled %s: %d rows", d, len(rows))
+        _time.sleep(delay)
+    log.info("backfill done: %d days pulled, %d empty, %d already present",
+             pulled, empty, len(have))
+
+
+def cmd_history(conn, code: str):
+    """Print the availability time series for one NC code. Day-over-day
+    drops are cases leaving the warehouse for local boards (statewide
+    aggregate — the state doesn't publish per-board history)."""
+    rows = conn.execute(
+        "SELECT report_date, listing_type, brand_name, total_available "
+        "FROM warehouse_snapshot WHERE nc_code=? GROUP BY report_date "
+        "ORDER BY report_date", (code,),
+    ).fetchall()
+    if not rows:
+        print(f"No history for NC code {code}. Run backfill first?")
+        return
+    print(f"{rows[0]['brand_name']} ({code}, {rows[0]['listing_type']})")
+    prev = None
+    for r in rows:
+        delta = "" if prev is None else f"  ({r['total_available'] - prev:+d})"
+        print(f"  {r['report_date']}  {r['total_available']:>6} cases{delta}")
+        prev = r["total_available"]
+
+
 def cmd_status(conn, cfg):
     print("Source health:")
     for r in conn.execute("SELECT * FROM health").fetchall():
@@ -185,9 +288,13 @@ def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     p = argparse.ArgumentParser(prog="ncbourbon")
     p.add_argument("command", choices=[
-        "poll-stocks", "poll-shipments", "poll-catalog", "poll-wake", "digest", "status",
+        "poll-stocks", "poll-shipments", "poll-boards", "poll-catalog", "poll-wake", "digest", "status",
+        "backfill", "history",
     ])
+    p.add_argument("arg", nargs="?", default=None, help="NC code (for history)")
     p.add_argument("--config", default=None)
+    p.add_argument("--days", type=int, default=90, help="backfill: how many days back")
+    p.add_argument("--delay", type=float, default=4.0, help="backfill: seconds between requests")
     args = p.parse_args(argv)
     cfg = load_config(args.config)
     conn = connect(cfg.db_path)
@@ -195,10 +302,13 @@ def main(argv=None):
     {
         "poll-stocks": lambda: cmd_poll_stocks(conn, cfg, session),
         "poll-shipments": lambda: cmd_poll_shipments(conn, cfg, session),
+        "poll-boards": lambda: cmd_poll_boards(conn, cfg, session),
         "poll-catalog": lambda: cmd_poll_catalog(conn, cfg, session),
         "poll-wake": lambda: cmd_poll_wake(conn, cfg, session),
         "digest": lambda: send_digest(conn, cfg.alerts),
         "status": lambda: cmd_status(conn, cfg),
+        "backfill": lambda: cmd_backfill(conn, cfg, session, args.days, args.delay),
+        "history": lambda: cmd_history(conn, args.arg or ""),
     }[args.command]()
 
 

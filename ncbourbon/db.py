@@ -83,6 +83,26 @@ CREATE TABLE IF NOT EXISTS health (
   last_error TEXT,
   consecutive_failures INTEGER DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS board_stock (
+  board TEXT NOT NULL,
+  plu TEXT NOT NULL,
+  name TEXT,
+  price TEXT,
+  store TEXT NOT NULL,
+  qty INTEGER,
+  observed_at TEXT NOT NULL,
+  PRIMARY KEY (board, plu, store, observed_at)
+);
+CREATE TABLE IF NOT EXISTS board_latest (
+  board TEXT NOT NULL,
+  plu TEXT NOT NULL,
+  store TEXT NOT NULL,
+  name TEXT,
+  price TEXT,
+  qty INTEGER,
+  updated_at TEXT,
+  PRIMARY KEY (board, plu, store)
+);
 CREATE INDEX IF NOT EXISTS idx_snapshot_code ON warehouse_snapshot (nc_code, fetched_at);
 """
 

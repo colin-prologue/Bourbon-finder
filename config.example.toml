@@ -30,5 +30,16 @@ enabled = true
 search_terms = ["blanton", "weller", "eh taylor", "eagle rare", "stagg", "van winkle", "old fitzgerald", "elmer", "michter", "elijah craig barrel proof"]
 
 [boards]
-# StockShipped alerts fire only for boards matching these substrings (empty = all boards).
+# NOTE: StockShipped (warehouse->board shipment report) was RETIRED by NC ABC in 2026;
+# watch_boards is legacy/unused, kept only for if the state ever restores that feed.
 watch_boards = ["Wake", "Durham", "Mecklenburg", "Orange", "Chapel Hill"]
+# ABC/GO per-store inventory: board subdomains of abcgo.app to poll (public, no login).
+# Only New Hanover ("nh") was live/public as of 2026-07-22; add subdomains as boards
+# come online (the platform advertises "new locations daily"). Wake/Meck are NOT here
+# (Wake has its own [wake] search; Meck uses the gated abctogo.com flow).
+abcgo_boards = ["nh"]
+# Terms POSTed to each board's inventory search. Leave empty to derive them at run time
+# from the live Allocation/Limited warehouse watchlist (recommended).
+search_terms = []
+# Durham County ABC runs its own public search (durhamabc.com) — separate adapter.
+durham = true
