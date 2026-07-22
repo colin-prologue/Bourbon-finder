@@ -88,3 +88,14 @@ def test_wake_diff_restock(tmp_path):
     # replay same snapshot -> no new events
     events2 = apply_wake_snapshot(conn, rows)
     assert not events2
+
+
+def test_nc_today_timezone():
+    """nc_today() must track America/New_York, not the runner's clock (the
+    UTC-midnight bug: GitHub runners asked for tomorrow's empty report)."""
+    from datetime import datetime, timezone, timedelta
+    from ncbourbon.sources.stocks import NC_TZ, nc_today
+    assert nc_today() == datetime.now(NC_TZ).date()
+    # NY is UTC-4 or UTC-5; between 8pm and midnight ET the UTC date is ahead
+    utc_now = datetime.now(timezone.utc)
+    assert nc_today() in (utc_now.date(), utc_now.date() - timedelta(days=1))

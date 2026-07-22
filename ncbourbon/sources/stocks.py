@@ -21,7 +21,8 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup
 
@@ -30,6 +31,16 @@ from ..http import fetch
 log = logging.getLogger(__name__)
 
 URL = "https://abc2.nc.gov/StoresBoards/Stocks"
+
+# The report is keyed to North Carolina's calendar day. A scheduler running
+# in UTC (e.g. GitHub Actions) is "tomorrow" between 8pm and midnight ET and
+# would request a not-yet-existing report, which returns an EMPTY table with
+# valid headers. Always compute the report date in NC's timezone.
+NC_TZ = ZoneInfo("America/New_York")
+
+
+def nc_today() -> date:
+    return datetime.now(NC_TZ).date()
 
 EXPECTED_HEADERS = [
     "NC Code",
@@ -62,10 +73,25 @@ class SchemaDriftError(RuntimeError):
 
 
 def fetch_stock_report(session, report_date: date | None = None, brand: str = "", timeout: int = 60) -> str:
-    d = report_date or date.today()
+    d = report_date or nc_today()
     body = {"ReportDate": f"{d.month}/{d.day}/{d.year}", "BrandName": brand}
     resp = fetch(session, "POST", URL, data=body, timeout=timeout)
     return resp.text
+
+
+def fetch_and_parse(session, timeout: int = 60) -> tuple[date, list["StockRow"]]:
+    """Fetch today's report (NC time). If it parses to zero rows — the date
+    just rolled over and the new day's report isn't populated yet — fall
+    back to yesterday's report rather than failing the poll."""
+    d = nc_today()
+    try:
+        return d, parse_stock_report(fetch_stock_report(session, d, timeout=timeout))
+    except SchemaDriftError as exc:
+        if "zero rows" not in str(exc):
+            raise
+        prev = d - timedelta(days=1)
+        log.info("report for %s is empty; falling back to %s", d, prev)
+        return prev, parse_stock_report(fetch_stock_report(session, prev, timeout=timeout))
 
 
 def _page_snippet(soup: BeautifulSoup, limit: int = 300) -> str:

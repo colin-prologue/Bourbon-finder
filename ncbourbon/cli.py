@@ -11,8 +11,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import sys
-from datetime import date
 
 from . import alerts as alerts_mod
 from .alerts import alert, send_digest
@@ -52,16 +50,15 @@ def _health(conn, cfg, source: str, ok: bool, error: str = ""):
 
 def cmd_poll_stocks(conn, cfg, session):
     try:
-        html = stocks.fetch_stock_report(session, timeout=cfg.request_timeout)
-        rows = stocks.parse_stock_report(html)
+        report_date, rows = stocks.fetch_and_parse(session, timeout=cfg.request_timeout)
     except Exception as exc:  # noqa: BLE001 — record and alert on repeated failure
         log.error("poll-stocks failed: %s", exc, exc_info=True)
         _health(conn, cfg, "stocks", False, str(exc))
         raise SystemExit(1)
     _health(conn, cfg, "stocks", True)
-    events = apply_stock_snapshot(conn, rows, cfg.watch, date.today().isoformat())
+    events = apply_stock_snapshot(conn, rows, cfg.watch, report_date.isoformat())
     _emit(conn, cfg, events)
-    log.info("stocks: %d rows, %d events", len(rows), len(events))
+    log.info("stocks: %d rows (report %s), %d events", len(rows), report_date, len(events))
 
 
 def cmd_poll_shipments(conn, cfg, session):
