@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from .config import WatchConfig
 from .db import now_iso
 from .sources.stocks import StockRow
+from .sources.abcgo import BoardStoreStock
 from .sources.wake import WakeStoreStock
 
 
@@ -179,6 +180,46 @@ def apply_wake_snapshot(conn: sqlite3.Connection, rows: list[WakeStoreStock]) ->
             "ON CONFLICT(plu, store) DO UPDATE SET qty=excluded.qty, name=excluded.name, "
             "updated_at=excluded.updated_at",
             (r.plu, r.store, r.name, r.qty, ts),
+        )
+    conn.commit()
+    return events
+
+
+def apply_board_snapshot(conn: sqlite3.Connection, rows: list[BoardStoreStock]) -> list[Event]:
+    """Store-level board inventory (ABC/GO). Emits board_restock when a
+    (board, plu, store) goes 0 -> >0 — confirmation a rare bottle is on a
+    shelf now. Stage B of the two-stage model (stage A = warehouse arrival)."""
+    events: list[Event] = []
+    ts = now_iso()
+    prev = {
+        (r["board"], r["plu"], r["store"]): r["qty"]
+        for r in conn.execute("SELECT board, plu, store, qty FROM board_latest").fetchall()
+    }
+    for r in rows:
+        conn.execute(
+            "INSERT OR IGNORE INTO board_stock (board, plu, name, price, store, qty, observed_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (r.board, r.plu, r.name, r.price, r.store, r.qty, ts),
+        )
+        old = prev.get((r.board, r.plu, r.store))
+        if r.qty > 0 and (old is None or old == 0):
+            price = f", {r.price}" if r.price else ""
+            events.append(
+                Event(
+                    "board_restock",
+                    f"{r.board}:{r.plu}:{r.store}",
+                    f"[{r.board.upper()} ABC] On shelf: {r.name}",
+                    f"{r.name} (NC {r.plu}{price})\n"
+                    f"{r.qty} on hand @ {r.store}\n"
+                    f"Live per-store confirmation via {r.board}.abcgo.app — "
+                    "bottles can be pre-claimed by mixed-beverage accounts, so move fast.",
+                )
+            )
+        conn.execute(
+            "INSERT INTO board_latest (board, plu, store, name, price, qty, updated_at) "
+            "VALUES (?,?,?,?,?,?,?) ON CONFLICT(board, plu, store) DO UPDATE SET "
+            "qty=excluded.qty, name=excluded.name, price=excluded.price, updated_at=excluded.updated_at",
+            (r.board, r.plu, r.store, r.name, r.price, r.qty, ts),
         )
     conn.commit()
     return events
