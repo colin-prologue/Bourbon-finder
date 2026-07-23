@@ -61,20 +61,39 @@ def _price(item: dict) -> str:
     return "" if val is None else str(val)
 
 
-def search(session, term: str, timeout: int = 60, limit: int = 50) -> list[dict]:
-    """Items search for `term`. Returns the raw item dicts (each already carries
-    per-store on-hand under quantityavailableforstorepickup_detail.locations)."""
-    url = (
-        f"{BASE}{SEARCH_PATH}?q={quote(term)}&limit={limit}&offset=0"
-        "&fieldset=details&country=US&language=en&currency=USD"
-    )
-    resp = fetch(session, "GET", url, timeout=timeout)
-    try:
-        data = resp.json()
-    except ValueError:
-        return []
-    items = data.get("items") if isinstance(data, dict) else None
-    return items if isinstance(items, list) else []
+MAX_ITEMS = 1000  # runaway guard: stop paging a single term past this many items
+
+
+def search(session, term: str, timeout: int = 60, page_size: int = 50) -> list[dict]:
+    """Items search for `term`, following offsets until the results cover the
+    reported `total` (SuiteCommerce caps each page at `page_size`). Returns the
+    raw item dicts (each already carries per-store on-hand under
+    quantityavailableforstorepickup_detail.locations). Never silently caps at
+    one page — a watched bottle beyond the first page would otherwise be missed."""
+    out: list[dict] = []
+    offset = 0
+    while True:
+        url = (
+            f"{BASE}{SEARCH_PATH}?q={quote(term)}&limit={page_size}&offset={offset}"
+            "&fieldset=details&country=US&language=en&currency=USD"
+        )
+        resp = fetch(session, "GET", url, timeout=timeout)
+        try:
+            data = resp.json()
+        except ValueError:
+            break
+        page = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(page, list) or not page:
+            break
+        out.extend(page)
+        offset += len(page)
+        total = data.get("total") if isinstance(data, dict) else None
+        if len(page) < page_size or (isinstance(total, int) and offset >= total):
+            break
+        if offset >= MAX_ITEMS:
+            log.warning("greensboro: term %r exceeded %d items; truncating", term, MAX_ITEMS)
+            break
+    return out
 
 
 def fetch_greensboro_stock(session, terms: list[str], timeout: int = 60) -> list[BoardStoreStock]:

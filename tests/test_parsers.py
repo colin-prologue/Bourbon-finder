@@ -1,6 +1,7 @@
 """Parser tests against fixtures reconstructed from live DOM captures
 (2026-07-21). Run: python -m pytest tests/ -v
 """
+import re
 from pathlib import Path
 
 import pytest
@@ -297,3 +298,30 @@ def test_greensboro_fetch_end_to_end(monkeypatch):
     assert len(calls) == 2                      # one GET per term (no detail fetch)
     assert len(rows) == 3                       # one item, three stores (deduped)
     assert {r.qty for r in rows} == {25, 0, 10}
+
+
+def test_greensboro_search_paginates(monkeypatch):
+    """search() follows offsets until it covers `total` — no silent 1-page cap."""
+    from ncbourbon.sources import greensboro
+
+    class _Resp:
+        def __init__(self, payload): self._payload = payload
+        def json(self): return self._payload
+
+    def mk(itemid):
+        return {"itemid": itemid, "displayname": itemid,
+                "quantityavailableforstorepickup_detail": {"locations": []}}
+
+    seen_offsets = []
+
+    def fake_fetch(session, method, url, *, timeout=60, data=None, json=None, headers=None):
+        off = int(re.search(r"offset=(\d+)", url).group(1))
+        seen_offsets.append(off)
+        # total=3, page_size=2 -> page1 [a,b], page2 [c] (short page ends it)
+        page = [mk("a"), mk("b")] if off == 0 else [mk("c")]
+        return _Resp({"total": 3, "items": page})
+
+    monkeypatch.setattr(greensboro, "fetch", fake_fetch)
+    items = greensboro.search(object(), "whiskey", page_size=2)
+    assert seen_offsets == [0, 2]               # requested both pages
+    assert [i["itemid"] for i in items] == ["a", "b", "c"]   # nothing dropped
