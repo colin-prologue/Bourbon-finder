@@ -40,8 +40,13 @@ Each board is ~100–130 lines. Two shapes seen so far; pick whichever the site 
 1. **Recon** the board site directly (curl/requests). Find: (a) a product search that
    returns items, (b) per-store availability, (c) where the NC code lives. Confirm no login.
 2. **Write `sources/<board>.py`** exposing `fetch_<board>_stock(session, terms, timeout) -> list[BoardStoreStock]`
-   with `board="<slug>"`. Skip items with 0 total on-hand before fetching detail; include per-store
-   0-qty rows so a later restock is detectable. Reuse `abcgo.BoardStoreStock`.
+   with `board="<slug>"`. Reuse `abcgo.BoardStoreStock`. **Emit a per-store row for every store the
+   source lists, including 0-qty ones, so a later restock is detectable as 0 -> >0.** Do NOT drop a
+   store just because it's empty. If the source only ever exposes *in-stock* state (so a sold-out
+   item disappears entirely rather than showing 0 — this is how ABC/GO behaves), you cannot observe
+   the zero directly: the poll must re-query previously-in-stock codes and pass an `observed` scope
+   to `apply_board_snapshot` so it can persist the sellout. See `abcgo.recheck_absent` + issue #2.
+   (Durham and Greensboro list 0-qty stores directly, so they need no re-query.)
 3. **Wire into `cmd_poll_boards`** (a few lines, same pattern as the Durham block) + a `[boards]` toggle in `config.py` and `config.example.toml`.
 4. **Add tests** to `tests/test_parsers.py`: one pure-parse test against a captured HTML/JSON fixture (include an out-of-stock store → qty 0), and one end-to-end with a fake `session`/`fetch` (see `test_durham_fetch_end_to_end` and `test_abcgo_details_to_stock` as templates).
 5. Politeness: 1 request per term + 1 per matched code; dedupe codes; cap detail fetches; descriptive User-Agent. Poll a few times/day.

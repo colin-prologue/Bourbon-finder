@@ -84,6 +84,28 @@ def details(session, board: str, code: str, timeout: int = 60) -> list[dict]:
     return _json_list(resp)
 
 
+def _json_list_trusted(resp) -> tuple[list[dict], bool]:
+    """Like _json_list but reports trust: (rows, trusted). trusted is True only
+    when the body was a genuine JSON list (a real result, possibly empty). A
+    non-200 (e.g. a 403 WAF page) or non-JSON/non-list body -> ([], False), so a
+    blocked/errored response is never mistaken for an empty sellout."""
+    if getattr(resp, "status_code", 200) != 200:
+        return [], False
+    try:
+        data = resp.json()
+    except ValueError:
+        return [], False
+    return (data, True) if isinstance(data, list) else ([], False)
+
+
+def details_trusted(session, board: str, code: str, timeout: int = 60) -> tuple[list[dict], bool]:
+    """Per-store rows plus a trust flag — used by the sellout re-check, which must
+    distinguish a genuine empty result from an error before zeroing anything."""
+    url = HOST_TEMPLATE.format(board=board) + DETAILS_PATH
+    resp = fetch(session, "POST", url, json={"code": code}, headers=API_HEADERS, timeout=timeout)
+    return _json_list_trusted(resp)
+
+
 def _fmt_store(row: dict) -> str:
     parts = [
         row.get("Address1") or "",
@@ -138,3 +160,43 @@ def fetch_board_stock(session, board: str, terms: list[str], timeout: int = 60) 
             price = str(prod.get("Retail") or "")
             out.extend(details_to_stock(board, code, name, price, details(session, board, code, timeout=timeout)))
     return out
+
+
+MAX_RECHECK = 40  # cap targeted sellout re-queries per board per run
+
+
+def recheck_absent(
+    session,
+    board: str,
+    prev_positive: dict[str, tuple[str, str]],
+    found_codes: set[str],
+    timeout: int = 60,
+    cap: int = MAX_RECHECK,
+) -> tuple[list[BoardStoreStock], set[tuple[str, str]]]:
+    """Resolve the sellout blind spot: ABC/GO search only returns in-stock items,
+    so a code that sold out board-wide simply disappears. For each code that was
+    in stock last run (`prev_positive`: code -> (name, price)) but is absent from
+    this run's search (`found_codes`), re-query it directly via `details(code)`
+    (code-addressable, independent of the term search).
+
+    Returns (rows, observed): `rows` are per-store rows for codes still holding
+    stock somewhere; `observed` is {(board, code)} for EVERY code re-checked —
+    including the ones that came back empty — so apply_board_snapshot can zero the
+    genuine sellouts within a trusted scope."""
+    rows: list[BoardStoreStock] = []
+    observed: set[tuple[str, str]] = set()
+    absent = [c for c in prev_positive if c not in found_codes]
+    for code in absent[:cap]:
+        name, price = prev_positive[code]
+        drows, trusted = details_trusted(session, board, code, timeout=timeout)
+        if not trusted:
+            # 403 / error page — we did NOT learn this code's state. Leaving it
+            # out of `observed` means apply_board_snapshot won't zero it, so a
+            # transient block can't fabricate a later restock.
+            continue
+        observed.add((board, code))
+        if drows:
+            rows.extend(details_to_stock(board, code, name, price, drows))
+    if len(absent) > cap:
+        log.warning("abcgo %s: sellout re-check capped at %d of %d absent codes", board, cap, len(absent))
+    return rows, observed

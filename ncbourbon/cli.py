@@ -109,10 +109,27 @@ def cmd_poll_boards(conn, cfg, session):
         log.info("poll-boards: empty watchlist and no configured search_terms; run poll-stocks first")
         return
     all_rows = []
+    observed: set[tuple[str, str]] = set()   # (board, code) whose per-store state we know this run
     for board in cfg.boards.abcgo_boards:
         ok, err = True, ""
         try:
-            all_rows.extend(abcgo.fetch_board_stock(session, board, terms, timeout=cfg.request_timeout))
+            board_rows = abcgo.fetch_board_stock(session, board, terms, timeout=cfg.request_timeout)
+            found = {r.plu for r in board_rows}
+            # Re-query codes that were in stock last run but vanished from search
+            # (ABC/GO hides sold-out items) so their sellout is detectable — see issue #2.
+            prev_pos = {
+                row["plu"]: (row["name"], row["price"])
+                for row in conn.execute(
+                    "SELECT plu, name, price FROM board_latest WHERE board=? AND qty>0 GROUP BY plu",
+                    (board,),
+                )
+            }
+            recheck_rows, recheck_obs = abcgo.recheck_absent(
+                session, board, prev_pos, found, timeout=cfg.request_timeout
+            )
+            board_rows.extend(recheck_rows)
+            all_rows.extend(board_rows)
+            observed |= {(board, c) for c in found} | recheck_obs
         except Exception as exc:  # noqa: BLE001
             ok, err = False, f"{board}: {exc}"
             log.warning("abcgo board %s failed: %s", board, exc, exc_info=True)
@@ -133,7 +150,7 @@ def cmd_poll_boards(conn, cfg, session):
             ok, err = False, str(exc)
             log.warning("greensboro board failed: %s", exc, exc_info=True)
         _health(conn, cfg, "greensboro", ok, err)
-    events = apply_board_snapshot(conn, all_rows)
+    events = apply_board_snapshot(conn, all_rows, observed=observed)
     _emit(conn, cfg, events)
     log.info("boards: %d store-rows across %d board(s), %d events",
              len(all_rows), len(cfg.boards.abcgo_boards), len(events))

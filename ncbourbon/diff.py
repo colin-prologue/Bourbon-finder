@@ -185,16 +185,31 @@ def apply_wake_snapshot(conn: sqlite3.Connection, rows: list[WakeStoreStock]) ->
     return events
 
 
-def apply_board_snapshot(conn: sqlite3.Connection, rows: list[BoardStoreStock]) -> list[Event]:
+def apply_board_snapshot(
+    conn: sqlite3.Connection,
+    rows: list[BoardStoreStock],
+    observed: set[tuple[str, str]] | None = None,
+) -> list[Event]:
     """Store-level board inventory (ABC/GO). Emits board_restock when a
     (board, plu, store) goes 0 -> >0 — confirmation a rare bottle is on a
-    shelf now. Stage B of the two-stage model (stage A = warehouse arrival)."""
+    shelf now. Stage B of the two-stage model (stage A = warehouse arrival).
+
+    `observed` is the set of (board, plu) codes whose current per-store state was
+    authoritatively determined this run (searched *or* re-queried). For those
+    codes, any previously-in-stock (board, plu, store) that is absent from `rows`
+    is a sellout: we persist qty 0 so a later reappearance fires 0 -> >0. This is
+    required for boards like ABC/GO whose API hides sold-out items entirely
+    (issue #2). Codes outside `observed` are left untouched — absence there only
+    means "not looked at this run" (e.g. a watchlist term wasn't searched), so
+    zeroing them would fabricate restocks. `observed=None` disables zeroing
+    (legacy behavior for adapters that already report per-store 0 rows)."""
     events: list[Event] = []
     ts = now_iso()
     prev = {
         (r["board"], r["plu"], r["store"]): r["qty"]
         for r in conn.execute("SELECT board, plu, store, qty FROM board_latest").fetchall()
     }
+    present = {(r.board, r.plu, r.store) for r in rows}
     for r in rows:
         conn.execute(
             "INSERT OR IGNORE INTO board_stock (board, plu, name, price, store, qty, observed_at) "
@@ -221,5 +236,21 @@ def apply_board_snapshot(conn: sqlite3.Connection, rows: list[BoardStoreStock]) 
             "qty=excluded.qty, name=excluded.name, price=excluded.price, updated_at=excluded.updated_at",
             (r.board, r.plu, r.store, r.name, r.price, r.qty, ts),
         )
+    if observed is not None:
+        for (board, plu, store), oldqty in prev.items():
+            if (
+                (board, plu) in observed
+                and oldqty
+                and oldqty > 0
+                and (board, plu, store) not in present
+            ):
+                # Sold out at this store (its code was re-checked but the store
+                # dropped off). Persist 0 so a later restock fires 0 -> >0. No
+                # event: selling out is not an alert, only the return is.
+                conn.execute(
+                    "UPDATE board_latest SET qty=0, updated_at=? "
+                    "WHERE board=? AND plu=? AND store=?",
+                    (ts, board, plu, store),
+                )
     conn.commit()
     return events
