@@ -84,6 +84,28 @@ def details(session, board: str, code: str, timeout: int = 60) -> list[dict]:
     return _json_list(resp)
 
 
+def _json_list_trusted(resp) -> tuple[list[dict], bool]:
+    """Like _json_list but reports trust: (rows, trusted). trusted is True only
+    when the body was a genuine JSON list (a real result, possibly empty). A
+    non-200 (e.g. a 403 WAF page) or non-JSON/non-list body -> ([], False), so a
+    blocked/errored response is never mistaken for an empty sellout."""
+    if getattr(resp, "status_code", 200) != 200:
+        return [], False
+    try:
+        data = resp.json()
+    except ValueError:
+        return [], False
+    return (data, True) if isinstance(data, list) else ([], False)
+
+
+def details_trusted(session, board: str, code: str, timeout: int = 60) -> tuple[list[dict], bool]:
+    """Per-store rows plus a trust flag — used by the sellout re-check, which must
+    distinguish a genuine empty result from an error before zeroing anything."""
+    url = HOST_TEMPLATE.format(board=board) + DETAILS_PATH
+    resp = fetch(session, "POST", url, json={"code": code}, headers=API_HEADERS, timeout=timeout)
+    return _json_list_trusted(resp)
+
+
 def _fmt_store(row: dict) -> str:
     parts = [
         row.get("Address1") or "",
@@ -165,9 +187,14 @@ def recheck_absent(
     observed: set[tuple[str, str]] = set()
     absent = [c for c in prev_positive if c not in found_codes]
     for code in absent[:cap]:
-        observed.add((board, code))
         name, price = prev_positive[code]
-        drows = details(session, board, code, timeout=timeout)
+        drows, trusted = details_trusted(session, board, code, timeout=timeout)
+        if not trusted:
+            # 403 / error page — we did NOT learn this code's state. Leaving it
+            # out of `observed` means apply_board_snapshot won't zero it, so a
+            # transient block can't fabricate a later restock.
+            continue
+        observed.add((board, code))
         if drows:
             rows.extend(details_to_stock(board, code, name, price, drows))
     if len(absent) > cap:

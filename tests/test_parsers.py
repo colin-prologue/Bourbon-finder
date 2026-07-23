@@ -167,6 +167,20 @@ def test_abcgo_recheck_absent(monkeypatch):
     assert rows[0].qty == 4 and rows[0].name == "Buffalo Trace"
 
 
+def test_abcgo_recheck_ignores_untrusted_details(monkeypatch):
+    """A 403/error page parses to an empty list too; it must NOT be read as a
+    sellout, or the next healthy poll fabricates board_restock alerts."""
+    from ncbourbon.sources import abcgo
+
+    class _Resp403:
+        status_code = 403
+        def json(self): raise ValueError("not json (WAF block page)")
+
+    monkeypatch.setattr(abcgo, "fetch", lambda *a, **k: _Resp403())
+    rows, observed = abcgo.recheck_absent(object(), "nh", {"20624": ("BT", "22.95")}, found_codes=set())
+    assert rows == [] and observed == set()   # untrusted response -> not observed, not zeroed
+
+
 def test_abcgo_recheck_absent_skips_found_codes(monkeypatch):
     """Codes already returned by this run's search are not re-queried."""
     from ncbourbon.sources import abcgo
