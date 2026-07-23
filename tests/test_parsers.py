@@ -181,6 +181,47 @@ def test_abcgo_recheck_ignores_untrusted_details(monkeypatch):
     assert rows == [] and observed == set()   # untrusted response -> not observed, not zeroed
 
 
+def test_abcgo_search_ok_details_403_does_not_zero(monkeypatch):
+    """Regression: if search finds a code in stock but its details() call is
+    blocked (403), the code yields no rows -> it's absent from `found` -> the
+    re-check finds it untrusted -> it never enters `observed`, so it is NOT
+    zeroed. A WAF block on details must not fabricate a later restock."""
+    from ncbourbon.db import connect
+    from ncbourbon.config import Config
+    from ncbourbon.diff import apply_board_snapshot
+    from ncbourbon.sources.abcgo import BoardStoreStock
+    from ncbourbon import cli
+    import ncbourbon.sources.abcgo as abcgo
+
+    conn = connect(":memory:")
+    cfg = Config()
+    cfg.boards.abcgo_boards = ["nh"]; cfg.boards.durham = False; cfg.boards.greensboro = False
+    cfg.boards.search_terms = ["buffalo"]
+    monkeypatch.setattr(cli, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "_health", lambda *a, **k: None)
+    # Previously in stock.
+    apply_board_snapshot(conn, [BoardStoreStock("nh", "20624", "Buffalo Trace", "22.95", "6 Market St", 5)],
+                         observed={("nh", "20624")})
+
+    class _Resp:
+        def __init__(self, payload=None, status=200, bad=False):
+            self._p, self.status_code, self._bad = payload, status, bad
+        def json(self):
+            if self._bad:
+                raise ValueError("403 WAF page")
+            return self._p
+
+    def fake_fetch(session, method, url, *, timeout=60, data=None, json=None, headers=None):
+        if url.endswith("/api/inventory/search"):
+            return _Resp([{"Code": "20624", "Brand": "Buffalo Trace", "Retail": "22.95", "OnHand": 5, "Stores": 1}])
+        return _Resp(status=403, bad=True)   # details() blocked
+    monkeypatch.setattr(abcgo, "fetch", fake_fetch)
+
+    cli.cmd_poll_boards(conn, cfg, object())
+    qty = conn.execute("SELECT qty FROM board_latest WHERE board='nh' AND plu='20624'").fetchone()["qty"]
+    assert qty == 5   # untouched — a details 403 is not a sellout
+
+
 def test_abcgo_recheck_absent_skips_found_codes(monkeypatch):
     """Codes already returned by this run's search are not re-queried."""
     from ncbourbon.sources import abcgo

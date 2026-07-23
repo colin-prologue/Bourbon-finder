@@ -84,8 +84,10 @@ good citizen — the defaults already are:
   confirms shelf presence instead of predicting it. `poll-shipments` is
   kept only as a cheap liveness ping that warns if the feed ever returns.
 - NC ABC error pages come back **HTTP 200**; parsers detect them by title.
-  Board sites can also serve a 403 (WAF) to datacenter IPs — the fetcher
-  treats non-200 as untrusted so a block is never read as a sellout.
+  Board sites can also serve a 403 (WAF) to datacenter IPs. A blocked
+  response yields no usable rows, and the ABC/GO sellout re-check only zeros
+  a code whose state was *authoritatively* re-fetched (a trusted 200/JSON
+  response) — so a transient 403 is never mistaken for a sellout.
 - NC Codes appear dashed (`18-650`) in pricing pages and dashless (`18650`)
   in the stock report and Wake PLUs — `normalize_nc_code()` folds them.
 - The allocated-list xlsx's landing page shows a stale "Last Updated";
