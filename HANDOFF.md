@@ -6,11 +6,11 @@ needs to continue is here or in the repo. (Deeper research lives in the claude.a
 
 ## TL;DR — where things stand
 - Working tool that watches NC's liquor system for Allocation/Limited bourbon and emails on movement.
-- **Current branch: `board-leg-abcgo`** (based on `main`, changes UNCOMMITTED — review with `git diff main`, then commit).
-- **15/15 tests pass** on Python 3.11 (`python -m pytest tests/ -q`).
-- The big recent change: the state's warehouse→board shipment feed (StockShipped) was **retired by NC ABC**, so the "board leg" was rebuilt as direct per-store polling of individual board sites (new `poll-boards` command).
-- **Boards with working store-level adapters:** Wake (own site), New Hanover (ABC/GO), Durham (own site).
-- **Next work:** add nearby boards — Orange (priority: user lives there), then Alamance (Burlington/Mebane), Guilford (Greensboro/High Point), Chatham, Granville, Franklin, Person, Johnston.
+- **Status: board leg shipped and live on `main`.** `poll-boards` (PRs #1/#3) has per-store adapters for New Hanover (ABC/GO), Durham, and Greensboro; the ABC/GO sellout→missed-restock bug is fixed (issue #2, PR #4).
+- **23/23 tests pass** (`python -m pytest tests/ -q`). Local `.venv` is Python 3.14 (fine — code needs 3.11+ for stdlib `tomllib`); `pip install -r requirements.txt` + `pip install pytest` into it.
+- The big change (2026-07): the state's warehouse→board shipment feed (StockShipped) was **retired by NC ABC**, so the "board leg" was rebuilt as direct per-store polling of individual board sites (`poll-boards`).
+- **Boards with working store-level adapters:** Wake (own site), New Hanover (ABC/GO), Durham (own site), Greensboro (SuiteCommerce).
+- **Next work:** new-board coverage via clean public APIs is largely exhausted (see roadmap below) — favor correctness/polish over more board hunts. Greensboro store-name enrichment is in progress on a side branch.
 
 ## Dev environment / workflow (native, on this machine)
 - Python 3.11+ required (`config.py` uses stdlib `tomllib`). Recreate the venv locally if needed — the checked-in `.venv` points at a macOS 3.14 framework path and may be stale.
@@ -18,7 +18,7 @@ needs to continue is here or in the repo. (Deeper research lives in the claude.a
 - Run tests: `python -m pytest tests/ -q`
 - Recon is easy from this machine: the NC ABC + board sites are public and your IP is not blocked, so just `curl`/`requests` them directly. (A prior cloud session had to drive a browser because its sandbox egress was firewalled — you don't have that limitation.)
 - Run a loop: `python -m ncbourbon poll-boards` (needs `config.toml`; copy from `config.example.toml`, set SMTP via `NCBOURBON_SMTP_PASSWORD`).
-- NOTE: `README.md` is slightly stale — it still lists `poll-shipments` as an active pre-shelf signal. It's now a deprecated liveness ping (see below). Update the README when convenient.
+- `poll-shipments` is a deprecated liveness ping (StockShipped retired); don't build on it. The README loop table reflects the current `poll-boards`-based two-stage model.
 - Housekeeping: a `_to_delete/` folder holds stale `.git/index.lock` files left by a cloud session that couldn't delete files; safe to remove. `ncbourbon.db` is a local state DB (gitignored data, not code).
 
 ## Architecture (two-stage alerting)
@@ -73,13 +73,16 @@ Own site `https://durhamabc.com`. Public, no login, plain GETs.
 - **eLicensee** (`<board>abc.elicensee.com`) — the B2B licensee portal for many boards; login-gated, off-limits.
 - No public NC allocation methodology / per-board quantity report exists (warehouse-controlled; effectively size/sales-weighted per 2023 journalism). Don't look for a formula.
 
-## Next-boards roadmap (recon → adapter → test → commit, per board)
-Priority order (closest to user in Durham/Orange/Wake, and likeliest to get allocation):
-1. **Orange** — `orangeabc.com` (user lives here; not yet covered). Check for a public search vs. only a gated eLicensee portal.
-2. **Alamance area** — separate municipal boards: Burlington, Graham, **Mebane** (nearly on user's doorstep), Elon.
-3. **Guilford** — separate boards: **Greensboro ABC**, High Point ABC (large metro → real allocation).
-4. **Chatham** (Pittsboro/Siler City), **Granville** (Butner/Creedmoor/Oxford), **Franklin** (Louisburg), **Person** (Roxboro), **Johnston** (Clayton/Smithfield).
-None of these are on ABC/GO (already probed), so each needs its own site check: expect either a Durham-style public search (buildable), a gated eLicensee portal (skip), or nothing public.
+## Next-boards roadmap — mostly exhausted (recon settled 2026-07-23)
+The nearby/metro boards were reconned this session; clean-API options are largely tapped:
+- **Greensboro (Guilford)** — **DONE.** SuiteCommerce API (`shop.greensboroabc.com/api/items`), per-store qty inline; `sources/greensboro.py`.
+- **Orange** (`orangeabc.com`) — **SKIP.** WordPress brochure site; rare bourbon goes via an annual lottery (entries close Nov 30), nothing to poll.
+- **Alamance / Mebane / Burlington** — **SKIP.** Alamance Municipal ABC Board is a brochure page on `burlingtonnc.gov`; no online inventory search, no store site resolves.
+- **High Point (Guilford)** — **POOR FIT.** Shopify (`highpointabc.com`), but allocated bottles aren't in the catalog and per-store stock is locked in an embedded Power BI report — only worth it if someone takes on the brittle Power BI scrape.
+- **Mecklenburg (Charlotte)** — gated on `abctogo.com` (age-gate + CSRF); no public per-store feed.
+- **Untouched, likely nothing public:** Chatham, Granville, Franklin, Person, Johnston — small boards; expect brochure-only. Verify a pollable per-store feed exists before building.
+
+Pattern: only metro e-commerce boards whose platform exposes allocated bottles + per-store qty via API are buildable — Wake, New Hanover, Durham, Greensboro cover that set today.
 
 ## Gotchas / lessons
 - Warehouse report for *today* (NC calendar day) can be empty until generated; `stocks.nc_today()` computes the date in America/New_York and `fetch_and_parse()` falls back to the previous day. Keep this — a UTC scheduler otherwise requests a not-yet-existing report.
@@ -87,6 +90,6 @@ None of these are on ABC/GO (already probed), so each needs its own site check: 
 - Broker Name on the warehouse report is the supplier's sales rep (a person), NOT a store — irrelevant to routing. It is already absent from the alert email body.
 
 ## Immediate next steps
-1. Review `git diff main` on `board-leg-abcgo`; commit; add `poll-boards` to the scheduler (`.github/workflows/poll.yml` and/or cron, ~2–4×/day).
-2. Recon + build the Orange adapter first, then work down the roadmap.
-3. Update the stale `README.md` loop table (poll-shipments → poll-boards).
+- Board leg + sellout fix are merged; `poll-boards` runs in the scheduler (`.github/workflows/poll.yml`, 3×/day) and the README loop table is current.
+- **Greensboro store-name enrichment** is in flight on a side branch (adds real store addresses to alerts via `/scs/services/Location.Service.ss`; decouples the display name from the stable store key so editing the map doesn't re-fire restocks). Review/merge when it opens a PR — it rebases on the merged `apply_board_snapshot` changes from PR #4.
+- No clean new-board targets remain (see roadmap). Optional future work: TTB COLA early warning, VA ABC (v2) per the research report, or the High Point Power BI route.
