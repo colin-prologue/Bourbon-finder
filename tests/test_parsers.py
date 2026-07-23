@@ -142,6 +142,49 @@ def test_abcgo_details_to_stock():
     assert stock[0].board == "nh"
 
 
+def test_abcgo_recheck_absent(monkeypatch):
+    """Re-query previously-in-stock codes that vanished from search: still-stocked
+    ones yield rows, sold-out ones yield none, and BOTH land in `observed` scope
+    so apply_board_snapshot can zero the true sellout (issue #2)."""
+    from ncbourbon.sources import abcgo
+
+    class _Resp:
+        def __init__(self, payload): self._payload = payload
+        def json(self): return self._payload
+
+    def fake_fetch(session, method, url, *, timeout=60, data=None, json=None, headers=None):
+        code = (json or {}).get("code")
+        if code == "20624":   # still in stock at one store
+            return _Resp([{"StoreId": "004", "Code": "20624", "Address1": "6 Market St",
+                           "City": "Wilmington", "State": "NC", "Zip": "28401", "OnHand": 4}])
+        return _Resp([])       # 19319 fully sold out -> empty
+
+    monkeypatch.setattr(abcgo, "fetch", fake_fetch)
+    prev_positive = {"20624": ("Buffalo Trace", "22.95"), "19319": ("Eagle Rare", "46.95")}
+    rows, observed = abcgo.recheck_absent(object(), "nh", prev_positive, found_codes=set())
+    assert observed == {("nh", "20624"), ("nh", "19319")}   # both re-checked -> in scope
+    assert [r.plu for r in rows] == ["20624"]               # only the still-stocked one has rows
+    assert rows[0].qty == 4 and rows[0].name == "Buffalo Trace"
+
+
+def test_abcgo_recheck_absent_skips_found_codes(monkeypatch):
+    """Codes already returned by this run's search are not re-queried."""
+    from ncbourbon.sources import abcgo
+
+    called = []
+
+    def fake_fetch(session, method, url, *, timeout=60, data=None, json=None, headers=None):
+        called.append((json or {}).get("code"))
+        class _R:
+            def json(self): return []
+        return _R()
+
+    monkeypatch.setattr(abcgo, "fetch", fake_fetch)
+    rows, observed = abcgo.recheck_absent(
+        object(), "nh", {"20624": ("BT", "22.95")}, found_codes={"20624"})
+    assert called == [] and rows == [] and observed == set()
+
+
 def test_abcgo_json_list_handles_garbage():
     from ncbourbon.sources.abcgo import _json_list
 
@@ -176,6 +219,43 @@ def test_apply_board_snapshot_restock_transition():
     assert "20581" in events[0].body and "Fuquay" in events[0].body
     # Still in stock next poll -> no duplicate event.
     assert apply_board_snapshot(conn, one) == []
+
+
+def test_apply_board_snapshot_sellout_persists_zero_for_observed_codes():
+    """ABC/GO regression (issue #2): a store that sells out (absent from the
+    snapshot) is zeroed *when its code was re-checked this run* (in `observed`),
+    so a later restock fires 0 -> >0."""
+    from ncbourbon.db import connect
+    from ncbourbon.diff import apply_board_snapshot
+    from ncbourbon.sources.abcgo import BoardStoreStock
+
+    conn = connect(":memory:")
+    store, code = "6 Market St Wilmington NC", "20624"
+    scope = {("nh", code)}
+    # In stock (seed; first sighting fires a restock we don't care about here).
+    apply_board_snapshot(conn, [BoardStoreStock("nh", code, "Buffalo Trace", "22.95", store, 3)], observed=scope)
+    # Sells out board-wide: absent from snapshot, but the code WAS re-queried.
+    assert apply_board_snapshot(conn, [], observed=scope) == []   # selling out is not an alert
+    # Restocks -> exactly one board_restock (proves the store was zeroed on sellout).
+    events = apply_board_snapshot(conn, [BoardStoreStock("nh", code, "Buffalo Trace", "22.95", store, 2)], observed=scope)
+    assert len(events) == 1 and events[0].kind == "board_restock"
+
+
+def test_apply_board_snapshot_absence_outside_scope_does_not_zero():
+    """A code NOT re-checked this run (absent from `observed`) must NOT be zeroed
+    on mere absence — otherwise a watchlist-term change would fabricate restocks."""
+    from ncbourbon.db import connect
+    from ncbourbon.diff import apply_board_snapshot
+    from ncbourbon.sources.abcgo import BoardStoreStock
+
+    conn = connect(":memory:")
+    store, code = "6 Market St Wilmington NC", "20624"
+    apply_board_snapshot(conn, [BoardStoreStock("nh", code, "BT", "22.95", store, 3)], observed={("nh", code)})
+    # Next run: code absent AND out of scope (its term wasn't searched) -> no zeroing.
+    apply_board_snapshot(conn, [], observed=set())
+    # Reappears at same qty -> NO event, because old stayed 3 (never zeroed).
+    events = apply_board_snapshot(conn, [BoardStoreStock("nh", code, "BT", "22.95", store, 3)], observed={("nh", code)})
+    assert events == []
 
 
 # --- Durham board adapter (added 2026-07-22) --------------------------------

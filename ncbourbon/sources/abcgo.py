@@ -138,3 +138,38 @@ def fetch_board_stock(session, board: str, terms: list[str], timeout: int = 60) 
             price = str(prod.get("Retail") or "")
             out.extend(details_to_stock(board, code, name, price, details(session, board, code, timeout=timeout)))
     return out
+
+
+MAX_RECHECK = 40  # cap targeted sellout re-queries per board per run
+
+
+def recheck_absent(
+    session,
+    board: str,
+    prev_positive: dict[str, tuple[str, str]],
+    found_codes: set[str],
+    timeout: int = 60,
+    cap: int = MAX_RECHECK,
+) -> tuple[list[BoardStoreStock], set[tuple[str, str]]]:
+    """Resolve the sellout blind spot: ABC/GO search only returns in-stock items,
+    so a code that sold out board-wide simply disappears. For each code that was
+    in stock last run (`prev_positive`: code -> (name, price)) but is absent from
+    this run's search (`found_codes`), re-query it directly via `details(code)`
+    (code-addressable, independent of the term search).
+
+    Returns (rows, observed): `rows` are per-store rows for codes still holding
+    stock somewhere; `observed` is {(board, code)} for EVERY code re-checked —
+    including the ones that came back empty — so apply_board_snapshot can zero the
+    genuine sellouts within a trusted scope."""
+    rows: list[BoardStoreStock] = []
+    observed: set[tuple[str, str]] = set()
+    absent = [c for c in prev_positive if c not in found_codes]
+    for code in absent[:cap]:
+        observed.add((board, code))
+        name, price = prev_positive[code]
+        drows = details(session, board, code, timeout=timeout)
+        if drows:
+            rows.extend(details_to_stock(board, code, name, price, drows))
+    if len(absent) > cap:
+        log.warning("abcgo %s: sellout re-check capped at %d of %d absent codes", board, cap, len(absent))
+    return rows, observed
