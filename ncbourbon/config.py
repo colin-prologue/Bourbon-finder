@@ -52,6 +52,8 @@ class BoardsConfig:
     search_terms: list[str] = field(default_factory=list)
     # Durham County ABC (its own site durhamabc.com, not on ABC/GO).
     durham: bool = True
+    # Greensboro (Guilford) ABC — SuiteCommerce storefront shop.greensboroabc.com.
+    greensboro: bool = True
 
 
 @dataclass
@@ -102,5 +104,6 @@ def load_config(path: str | None = None) -> Config:
         abcgo_boards=list(b.get("abcgo_boards", ["nh"])),
         search_terms=list(b.get("search_terms", [])),
         durham=b.get("durham", True),
+        greensboro=b.get("greensboro", True),
     )
     return cfg

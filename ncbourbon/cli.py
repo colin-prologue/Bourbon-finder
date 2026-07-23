@@ -26,7 +26,7 @@ from .diff import (
 )
 from .http import make_session
 from .sources import catalog as catalog_mod
-from .sources import abcgo, durham, stock_shipped, stocks, wake
+from .sources import abcgo, durham, greensboro, stock_shipped, stocks, wake
 
 log = logging.getLogger("ncbourbon")
 
@@ -125,6 +125,14 @@ def cmd_poll_boards(conn, cfg, session):
             ok, err = False, str(exc)
             log.warning("durham board failed: %s", exc, exc_info=True)
         _health(conn, cfg, "durham", ok, err)
+    if cfg.boards.greensboro:
+        ok, err = True, ""
+        try:
+            all_rows.extend(greensboro.fetch_greensboro_stock(session, terms, timeout=cfg.request_timeout))
+        except Exception as exc:  # noqa: BLE001
+            ok, err = False, str(exc)
+            log.warning("greensboro board failed: %s", exc, exc_info=True)
+        _health(conn, cfg, "greensboro", ok, err)
     events = apply_board_snapshot(conn, all_rows)
     _emit(conn, cfg, events)
     log.info("boards: %d store-rows across %d board(s), %d events",

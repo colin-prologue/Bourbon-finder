@@ -235,3 +235,65 @@ def test_durham_fetch_end_to_end(monkeypatch):
     assert by_store["1928 Holloway Street Durham, NC 27703"] == 2
     assert by_store["2806 Hillsborough Road Durham, NC 27705"] == 0
     assert rows[0].plu == "20581" and rows[0].name == "E.H. TAYLOR JR. SMALL BATCH"
+
+
+# --- Greensboro board adapter (added 2026-07-22) ----------------------------
+# shop.greensboroabc.com is NetSuite SuiteCommerce. GET /api/items?q=<term>&
+# fieldset=details returns matched items; each carries per-store on-hand inline
+# under quantityavailableforstorepickup_detail.locations (internalid + qty), so
+# one search call yields every store's quantity — no per-item detail fetch, and
+# every store (including 0-qty) is always reported (immune to the sellout gap).
+
+# Trimmed real shape (Maker's Mark .75L, NC code 24275) — one 0-qty store (30).
+_GREENSBORO_ITEMS = [
+    {
+        "itemid": "24275",
+        "displayname": "Maker's Mark (BTB) .75L",
+        "onlinecustomerprice_detail": {"onlinecustomerprice": 33.95},
+        "quantityavailableforstorepickup_detail": {
+            "locations": [
+                {"internalid": 28, "qtyavailableforstorepickup": 25.0},
+                {"internalid": 30, "qtyavailableforstorepickup": 0.0},
+                {"internalid": 32, "qtyavailableforstorepickup": 10.0},
+            ]
+        },
+    }
+]
+
+
+def test_greensboro_items_to_stock():
+    """SuiteCommerce items -> BoardStoreStock, one row per store incl. 0-qty."""
+    from ncbourbon.sources.greensboro import items_to_stock
+
+    rows = items_to_stock(_GREENSBORO_ITEMS)
+    assert all(r.board == "greensboro" and r.plu == "24275" for r in rows)
+    assert len(rows) == 3                      # every store row, including the 0
+    by_store = {r.store: r.qty for r in rows}
+    assert set(by_store.values()) == {25, 0, 10}   # qty coerced float -> int
+    assert 0 in by_store.values()              # sold-out store kept -> restock detectable
+    assert rows[0].name == "Maker's Mark (BTB) .75L"
+    assert rows[0].price == "33.95"
+
+
+def test_greensboro_fetch_end_to_end(monkeypatch):
+    from ncbourbon.sources import greensboro
+    from ncbourbon.sources.abcgo import BoardStoreStock
+
+    class _Resp:
+        def __init__(self, payload): self._payload = payload
+        def json(self): return self._payload
+
+    calls = []
+
+    def fake_fetch(session, method, url, *, timeout=60, data=None, json=None, headers=None):
+        calls.append(url)
+        assert "/api/items" in url
+        return _Resp({"total": 1, "items": _GREENSBORO_ITEMS})
+
+    monkeypatch.setattr(greensboro, "fetch", fake_fetch)
+    # Same item matched by two terms -> deduped by itemid, not double-counted.
+    rows = greensboro.fetch_greensboro_stock(object(), ["makers", "maker's mark"])
+    assert all(isinstance(r, BoardStoreStock) and r.board == "greensboro" for r in rows)
+    assert len(calls) == 2                      # one GET per term (no detail fetch)
+    assert len(rows) == 3                       # one item, three stores (deduped)
+    assert {r.qty for r in rows} == {25, 0, 10}

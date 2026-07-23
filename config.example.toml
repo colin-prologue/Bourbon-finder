@@ -43,3 +43,5 @@ abcgo_boards = ["nh"]
 search_terms = []
 # Durham County ABC runs its own public search (durhamabc.com) — separate adapter.
 durham = true
+# Greensboro (Guilford) ABC — SuiteCommerce storefront (shop.greensboroabc.com).
+greensboro = true
