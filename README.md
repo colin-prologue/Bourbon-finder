@@ -11,15 +11,23 @@ live in-browser and cross-checked by adversarial verification. See
 ## How it works
 
 NC is a control state, but everything funnels through one Raleigh warehouse
-whose inventory the ABC Commission publishes. The tool polls four public,
-unauthenticated sources and diffs snapshots:
+whose inventory the ABC Commission publishes. The tool polls several public,
+unauthenticated sources and diffs snapshots, mirroring how a bottle actually
+travels — supplier → Raleigh warehouse → local board → store shelf — in two
+stages:
 
 | Loop | Source | Cadence | What it catches |
 |---|---|---|---|
-| `poll-stocks` | Warehouse Stock Report (`abc2.nc.gov/StoresBoards/Stocks`) | every 15–20 min | Allocation/Limited items appearing in state stock; drawdowns as boards order |
-| `poll-shipments` | StockShipped (`abc2.nc.gov/Search/StockShipped`) | few times/day | bottles shipped to *your* county boards (pre-shelf signal) |
+| `poll-stocks` | Warehouse Stock Report (`abc2.nc.gov/StoresBoards/Stocks`) | every 15–20 min | **Stage A (radar):** Allocation/Limited items appearing in state stock; drawdowns as boards order |
+| `poll-boards` | Per-store board sites: New Hanover (ABC/GO), Durham, Greensboro | 2–4×/day | **Stage B (confirmation):** which shelf a rare bottle is on right now — emits `board_restock` |
+| `poll-wake` | Wake ABC store search (`wakeabc.com`) | 2–4×/day | store-level Wake restocks with addresses and quantities (separate legacy Wake path) |
 | `poll-catalog` | Special Items, New Items, allocated-list xlsx | daily | new NC Codes entering the system (~1 month early) |
-| `poll-wake` | Wake ABC store search (`wakeabc.com`) | 2–4×/day | store-level restocks with addresses and quantities |
+| `poll-shipments` | *deprecated* — StockShipped was retired by NC ABC (2026-07) | — | liveness ping only; warns loudly if the state ever restores the feed |
+
+Stage A is the radar (what rare bottle is in the state and moving); Stage B
+is confirmation (which store shelf it's on now). There is **no** advance
+per-county signal — the warehouse→board shipment feed (StockShipped) was
+retired, so board polling confirms rather than predicts.
 
 Alerts: instant email for Allocation/Limited events (deduped with a
 cooldown), plus a daily digest of everything in stock. All state lives in
@@ -45,7 +53,7 @@ state of the warehouse, not 60 simultaneous drops.
 
 ```cron
 */20 * * * *  cd /path/to/nc-bourbon-finder && .venv/bin/python -m ncbourbon poll-stocks
-15 8,12,17 * * *  cd /path/to/nc-bourbon-finder && .venv/bin/python -m ncbourbon poll-shipments && .venv/bin/python -m ncbourbon poll-wake
+15 8,12,17 * * *  cd /path/to/nc-bourbon-finder && .venv/bin/python -m ncbourbon poll-boards && .venv/bin/python -m ncbourbon poll-wake
 5 6 * * *  cd /path/to/nc-bourbon-finder && .venv/bin/python -m ncbourbon poll-catalog && .venv/bin/python -m ncbourbon digest
 ```
 
@@ -70,11 +78,16 @@ good citizen — the defaults already are:
 
 ## Known quirks (from live testing)
 
-- **StockShipped intermittently serves an error page** (HTTP 200, title
-  "Server Error") — observed 2026-07-21. The fetcher treats this as a soft
-  failure and self-discovers the form's field names on recovery, logging
-  the board list so you can pin `watch_boards`.
+- **StockShipped was retired by NC ABC** (2026-07) — it was the only
+  statewide warehouse→board shipment feed, so there is no advance
+  "which county gets it" signal anymore; the board leg (`poll-boards`)
+  confirms shelf presence instead of predicting it. `poll-shipments` is
+  kept only as a cheap liveness ping that warns if the feed ever returns.
 - NC ABC error pages come back **HTTP 200**; parsers detect them by title.
+  Board sites can also serve a 403 (WAF) to datacenter IPs. A blocked
+  response yields no usable rows, and the ABC/GO sellout re-check only zeros
+  a code whose state was *authoritatively* re-fetched (a trusted 200/JSON
+  response) — so a transient 403 is never mistaken for a sellout.
 - NC Codes appear dashed (`18-650`) in pricing pages and dashless (`18650`)
   in the stock report and Wake PLUs — `normalize_nc_code()` folds them.
 - The allocated-list xlsx's landing page shows a stale "Last Updated";
@@ -88,9 +101,13 @@ good citizen — the defaults already are:
 
 ## Extending
 
-- **More boards:** add a module in `ncbourbon/sources/` per board site and
-  a diff function — Wake (`wake.py`) is the template. Verify each board's
-  DOM yourself first.
+- **More boards:** add a module in `ncbourbon/sources/` per board site that
+  returns `BoardStoreStock` rows through the shared `poll-boards` path.
+  Existing adapters span three source shapes to copy from — ABC/GO JSON
+  (`abcgo.py`), plain HTML (`durham.py`), and SuiteCommerce (`greensboro.py`).
+  Recon each board's site yourself first; see the "HOW TO ADD A BOARD"
+  recipe in `HANDOFF.md`. (Note: many small municipal boards have no public
+  inventory at all — verify a pollable per-store feed exists before building.)
 - **Virginia (v2):** VA ABC posts live per-store inventory; the proven
   design is snapshot-and-diff several times daily (see research report,
   VABourbon section). VA limited items drop via random unannounced same-day
