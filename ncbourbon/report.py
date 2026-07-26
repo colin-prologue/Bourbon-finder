@@ -409,7 +409,18 @@ def for_subscriber(report: Report, sub) -> Report:
         if keep_name(c.name) and (not boards or c.board in boards)
     ]
     warehouse = [w for w in report.warehouse if keep_name(w.name)]
-    return replace(report, shelf=shelf, changes=changes, warehouse=warehouse)
+    # Source health narrows with everything else. A Greensboro-only reader has
+    # nothing to do about a Durham scraper failing, and a warning they cannot
+    # act on is the kind of thing that teaches people to skim past the section
+    # that also carries the ones they can. The statewide loops stay for
+    # everyone: they feed every board's watchlist.
+    sources = [
+        s for s in report.sources
+        if not boards or s.source in {"stocks", "catalog"} or s.source in boards
+    ]
+    return replace(
+        report, shelf=shelf, changes=changes, warehouse=warehouse, sources=sources
+    )
 
 
 def render_json(report: Report) -> dict:

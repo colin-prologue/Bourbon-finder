@@ -1179,6 +1179,22 @@ def test_report_narrows_to_a_subscribers_boards_and_brands():
     none = for_subscriber(report, Subscriber(email="a@b.c", patterns=["Pappy"]))
     assert none.shelf == []
 
+    # Source warnings narrow too: a Greensboro-only reader can do nothing about
+    # a Durham scraper, and unactionable warnings teach people to skim the
+    # section that also carries the actionable ones.
+    from ncbourbon.db import record_health
+
+    conn = _report_fixture_db()
+    for source in ("stocks", "catalog", "durham", "greensboro"):
+        record_health(conn, source, True)
+    cfg2 = Config()
+    cfg2.boards.abcgo_boards = []
+    full = build_report(conn, cfg2)
+    theirs = for_subscriber(full, Subscriber(email="a@b.c", boards=["greensboro"]))
+    named = {s.source for s in theirs.sources}
+    assert "durham" not in named
+    assert {"stocks", "catalog"} <= named      # statewide loops feed every board
+
 
 def test_digest_mails_each_subscriber_their_own_copy(monkeypatch):
     from ncbourbon import alerts as alerts_mod
