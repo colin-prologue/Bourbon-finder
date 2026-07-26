@@ -349,22 +349,29 @@ def test_new_board_seeds_silently():
     assert [e.key for e in events] == ["greensboro:27090"]
 
 
+def _catalog_items(source, codes):
+    from ncbourbon.sources.catalog import CatalogItem
+
+    return [
+        CatalogItem(nc_code=str(c), brand_name=f"Bourbon {c}",
+                    retail_price="$40", source=source)
+        for c in codes
+    ]
+
+
 def test_first_catalog_load_seeds_silently():
     """4,186 emails on the first poll-catalog; never again."""
     from ncbourbon.config import WatchConfig
     from ncbourbon.db import connect
     from ncbourbon.diff import apply_catalog_items
-    from ncbourbon.sources.catalog import CatalogItem
 
     conn = connect(":memory:")
-    items = [
-        CatalogItem(nc_code=str(i), brand_name=f"Bourbon {i}",
-                    retail_price="$40", source="special_items")
-        for i in range(50)
-    ]
+    items = _catalog_items("special_items", range(50))
     assert apply_catalog_items(conn, items, WatchConfig()) == []
     assert conn.execute("SELECT COUNT(*) FROM catalog").fetchone()[0] == 50
     # A genuinely new code afterwards is news.
+    from ncbourbon.sources.catalog import CatalogItem
+
     events = apply_catalog_items(
         conn,
         [CatalogItem(nc_code="999", brand_name="Pappy Van Winkle 23",
@@ -372,6 +379,27 @@ def test_first_catalog_load_seeds_silently():
         WatchConfig(),
     )
     assert [e.key for e in events] == ["999"]
+
+
+def test_each_catalog_feed_seeds_independently():
+    """poll-catalog persists whatever succeeded. If new_items lands on the first
+    run but special_items fails, special_items must still seed silently when it
+    recovers — a non-empty table is not evidence that *this* feed was seeded."""
+    from ncbourbon.config import WatchConfig
+    from ncbourbon.db import connect
+    from ncbourbon.diff import apply_catalog_items
+
+    conn = connect(":memory:")
+    # Run 1: only new_items came back.
+    assert apply_catalog_items(conn, _catalog_items("new_items", range(5)), WatchConfig()) == []
+    # Run 2: special_items recovers. Its backlog is a baseline, not 40 alerts.
+    assert apply_catalog_items(
+        conn, _catalog_items("special_items", range(100, 140)), WatchConfig()
+    ) == []
+    assert conn.execute("SELECT COUNT(*) FROM catalog").fetchone()[0] == 45
+    # Run 3: now both feeds are seeded, so a genuinely new code is news.
+    events = apply_catalog_items(conn, _catalog_items("special_items", [777]), WatchConfig())
+    assert [e.key for e in events] == ["777"]
 
 
 def test_daily_alert_cap_never_gags_health_warnings():

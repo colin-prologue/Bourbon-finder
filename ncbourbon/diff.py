@@ -161,9 +161,15 @@ def apply_stock_snapshot(
 def apply_catalog_items(conn: sqlite3.Connection, items, watch: WatchConfig) -> list[Event]:
     events: list[Event] = []
     ts = now_iso()
-    # An empty catalog means this is the first run. Every row would look new —
-    # that produced 4,186 emails in one morning. Seed it silently.
-    seeding = not conn.execute("SELECT 1 FROM catalog LIMIT 1").fetchone()
+    # Seeding is tracked per feed, not for the catalog as a whole. poll-catalog
+    # pulls special_items and new_items independently and persists whatever
+    # succeeded, so one feed failing on the first run would leave the table
+    # non-empty; when that feed later succeeded, every one of its pre-existing
+    # codes would read as new and burn the daily cap. A feed with no rows of its
+    # own has not been seeded yet, whatever the other feeds have done.
+    seeded_sources = {
+        r["source"] for r in conn.execute("SELECT DISTINCT source FROM catalog")
+    }
     for it in items:
         exists = conn.execute("SELECT 1 FROM catalog WHERE nc_code=?", (it.nc_code,)).fetchone()
         if exists:
@@ -174,6 +180,7 @@ def apply_catalog_items(conn: sqlite3.Connection, items, watch: WatchConfig) -> 
             (it.nc_code, it.brand_name, it.source, it.retail_price, ts),
         )
         interesting = name_watched(it.brand_name, watch)
+        seeding = it.source not in seeded_sources
         if not seeding and (it.source in ("special_items", "new_items") or interesting):
             events.append(
                 Event(
