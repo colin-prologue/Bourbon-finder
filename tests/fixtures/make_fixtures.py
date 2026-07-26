@@ -6,7 +6,12 @@ be exported), but every tag name, class, attribute pattern, header label,
 and sample value below was transcribed from the live DOM. If a parser test
 passes here but fails in production, the site changed — which the drift
 detection is designed to catch.
+
+The literals below are the source of truth; the files are build output and
+are not committed. openpyxl writes a zip whose bytes vary run-to-run, so
+regenerating into a tracked directory left the tree permanently dirty.
 """
+import sys
 from pathlib import Path
 
 import openpyxl
@@ -98,10 +103,16 @@ def make_xlsx(path: Path):
     wb.save(path)
 
 
+def build(dest: Path):
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "stocks_sample.html").write_text(STOCKS_HTML)
+    (dest / "wake_sample.html").write_text(WAKE_HTML)
+    (dest / "error_page.html").write_text(ERROR_HTML)
+    (dest / "stockshipped_sample.html").write_text(STOCKSHIPPED_HTML)
+    make_xlsx(dest / "allocated_sample.xlsx")
+
+
 if __name__ == "__main__":
-    (HERE / "stocks_sample.html").write_text(STOCKS_HTML)
-    (HERE / "wake_sample.html").write_text(WAKE_HTML)
-    (HERE / "error_page.html").write_text(ERROR_HTML)
-    (HERE / "stockshipped_sample.html").write_text(STOCKSHIPPED_HTML)
-    make_xlsx(HERE / "allocated_sample.xlsx")
-    print("fixtures written")
+    dest = Path(sys.argv[1]) if len(sys.argv) > 1 else HERE / "_build"
+    build(dest)
+    print(f"fixtures written to {dest}")

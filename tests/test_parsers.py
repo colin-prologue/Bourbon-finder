@@ -13,13 +13,16 @@ from ncbourbon.sources.catalog import normalize_nc_code, parse_allocated_xlsx
 from ncbourbon.sources.stocks import SchemaDriftError, parse_stock_report
 from ncbourbon.sources.wake import parse_wake_results
 
-FIXTURES = Path(__file__).parent / "fixtures"
+MAKE_FIXTURES = Path(__file__).parent / "fixtures" / "make_fixtures.py"
+# Build output, gitignored. Regenerated every run from the literals in
+# make_fixtures.py, which is the source of truth — nothing here is committed.
+FIXTURES = Path(__file__).parent / "fixtures" / "_build"
 
 
 @pytest.fixture(scope="session", autouse=True)
 def _build_fixtures():
     import subprocess, sys
-    subprocess.run([sys.executable, str(FIXTURES / "make_fixtures.py")], check=True)
+    subprocess.run([sys.executable, str(MAKE_FIXTURES), str(FIXTURES)], check=True)
 
 
 def test_parse_stock_report():
