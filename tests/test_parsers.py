@@ -705,6 +705,89 @@ def test_undelivered_alerts_do_not_consume_the_daily_cap(monkeypatch):
     assert conn.execute(
         "SELECT COUNT(*) FROM alert_log WHERE kind='capped:board_restock'"
     ).fetchone()[0] == 1
+def _report_fixture_db():
+    """A DB with one watched product on two shelves, one unwatched product,
+    and one product on an out-of-range board."""
+    from ncbourbon.db import connect
+    from ncbourbon.diff import apply_board_snapshot
+    from ncbourbon.sources.abcgo import BoardStoreStock
+
+    conn = connect(":memory:")
+    conn.execute("INSERT INTO allocated_list VALUES ('27090','Blantons','','L')")
+    conn.execute("INSERT INTO stock_latest VALUES ('27090',\"Blanton's\",'Allocation',13,'x')")
+    conn.commit()
+    apply_board_snapshot(conn, [
+        BoardStoreStock("greensboro", "27090", "Blanton's", "$65", "g25", 2, "Store 25, Greensboro"),
+        BoardStoreStock("greensboro", "27090", "Blanton's", "$65", "g29", 3, "Store 29, Greensboro"),
+        BoardStoreStock("greensboro", "17306", "Crystal Head Vodka", "$50", "g25", 9),
+        BoardStoreStock("nh", "27090", "Blanton's", "$65", "w1", 7, "Wilmington"),
+    ])
+    return conn
+
+
+def test_report_shelf_is_watched_products_on_reachable_shelves():
+    from ncbourbon.config import Config
+    from ncbourbon.report import build_report
+
+    cfg = Config()
+    cfg.boards.greensboro = True
+    cfg.boards.abcgo_boards = []          # New Hanover is out of driving range
+    cfg.wake.enabled = False
+    report = build_report(_report_fixture_db(), cfg)
+
+    assert [i.nc_code for i in report.shelf] == ["27090"]   # not the vodka
+    assert report.shelf[0].total == 5                       # 2 + 3, not 12
+    assert {s.board for s in report.shelf[0].stores} == {"greensboro"}
+    # The human label survives the round trip through the DB.
+    assert {s.label for s in report.shelf[0].stores} == {
+        "Store 25, Greensboro", "Store 29, Greensboro",
+    }
+
+
+def test_report_includes_out_of_range_board_when_it_is_re_enabled():
+    """The filter tracks configuration, not a hardcoded list."""
+    from ncbourbon.config import Config
+    from ncbourbon.report import build_report
+
+    cfg = Config()
+    cfg.boards.abcgo_boards = ["nh"]
+    cfg.wake.enabled = False
+    report = build_report(_report_fixture_db(), cfg)
+    assert {s.board for s in report.shelf[0].stores} == {"greensboro", "nh"}
+
+
+def test_report_renders_to_text_and_json():
+    from ncbourbon.config import Config
+    from ncbourbon.report import build_report, render_json, render_text
+
+    cfg = Config()
+    cfg.wake.enabled = False
+    report = build_report(_report_fixture_db(), cfg)
+
+    text = render_text(report)
+    assert "Blanton's" in text and "Crystal Head" not in text
+    assert "pictures, not a live feed" in text          # the freshness caveat
+
+    data = render_json(report)
+    assert data["shelf"][0]["stores"][0]["label"]       # nested dataclasses flatten
+    import json
+    json.dumps(data)                                    # must be serialisable as-is
+
+
+def test_report_flags_a_stale_source():
+    from ncbourbon.config import Config
+    from ncbourbon.db import record_health
+    from ncbourbon.report import build_report
+
+    conn = _report_fixture_db()
+    record_health(conn, "stocks", True)
+    conn.execute("UPDATE health SET last_ok='2020-01-01T00:00:00Z' WHERE source='stocks'")
+    record_health(conn, "greensboro", True)
+    conn.commit()
+
+    sources = {s.source: s for s in build_report(conn, Config()).sources}
+    assert sources["stocks"].stale                      # last ok in 2020
+    assert not sources["greensboro"].stale              # just now
 
 
 def test_board_history_records_changes_not_rereadings(monkeypatch):

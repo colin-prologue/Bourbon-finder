@@ -5,7 +5,8 @@
   python -m ncbourbon poll-boards     # a few times/day (ABC/GO per-store board inventory)
   python -m ncbourbon poll-catalog    # daily (Special Items, new items, xlsx)
   python -m ncbourbon poll-wake       # 2-4x/day (Wake ABC store inventory)
-  python -m ncbourbon digest          # daily summary email
+  python -m ncbourbon report          # print the current picture (no email)
+  python -m ncbourbon digest          # mail the same report
   python -m ncbourbon status          # print health + watched items
   python -m ncbourbon prune           # daily: trim history, reclaim DB pages
 """
@@ -30,6 +31,7 @@ from .diff import (
     apply_wake_snapshot,
 )
 from .http import make_session
+from .report import build_report, render_text
 from .sources import catalog as catalog_mod
 from .sources import abcgo, durham, greensboro, stock_shipped, stocks, wake
 
@@ -438,7 +440,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(prog="ncbourbon")
     p.add_argument("command", choices=[
         "poll-stocks", "poll-shipments", "poll-boards", "poll-catalog", "poll-wake", "digest", "status",
-        "backfill", "history", "prune",
+        "backfill", "history", "prune", "report",
     ])
     p.add_argument("arg", nargs="?", default=None, help="NC code (for history)")
     p.add_argument("--config", default=None)
@@ -458,7 +460,8 @@ def main(argv=None):
         "poll-boards": lambda: cmd_poll_boards(conn, cfg, session),
         "poll-catalog": lambda: cmd_poll_catalog(conn, cfg, session),
         "poll-wake": lambda: cmd_poll_wake(conn, cfg, session),
-        "digest": lambda: send_digest(conn, cfg.alerts),
+        "digest": lambda: send_digest(conn, cfg),
+        "report": lambda: print(render_text(build_report(conn, cfg))),
         "status": lambda: cmd_status(conn, cfg),
         "backfill": lambda: cmd_backfill(conn, cfg, session, args.days, args.delay),
         "history": lambda: cmd_history(conn, args.arg or ""),

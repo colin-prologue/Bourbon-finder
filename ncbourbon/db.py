@@ -131,6 +131,7 @@ CREATE TABLE IF NOT EXISTS board_latest (
   price TEXT,
   qty INTEGER,
   updated_at TEXT,
+  store_display TEXT,   -- human label; `store` stays the stable key
   PRIMARY KEY (board, plu, store)
 );
 CREATE INDEX IF NOT EXISTS idx_board_stock_observed ON board_stock (observed_at);
@@ -168,6 +169,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
         if "prev_qty" not in cols:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN prev_qty INTEGER")
             conn.commit()
+
+    # board_latest carries the stable store key; the human label used to exist
+    # only in the alert body and was lost once the poll ended. The report and
+    # site need it, so it is persisted alongside.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(board_latest)")}
+    if "store_display" not in cols:
+        conn.execute("ALTER TABLE board_latest ADD COLUMN store_display TEXT")
+        conn.commit()
 
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='warehouse_snapshot'"

@@ -401,10 +401,11 @@ def apply_board_snapshot(
         ):
             restocked.setdefault((r.board, r.plu), []).append(r)
         conn.execute(
-            "INSERT INTO board_latest (board, plu, store, name, price, qty, updated_at) "
-            "VALUES (?,?,?,?,?,?,?) ON CONFLICT(board, plu, store) DO UPDATE SET "
-            "qty=excluded.qty, name=excluded.name, price=excluded.price, updated_at=excluded.updated_at",
-            (r.board, r.plu, r.store, r.name, r.price, r.qty, ts),
+            "INSERT INTO board_latest (board, plu, store, name, price, qty, updated_at, store_display) "
+            "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(board, plu, store) DO UPDATE SET "
+            "qty=excluded.qty, name=excluded.name, price=excluded.price, "
+            "updated_at=excluded.updated_at, store_display=excluded.store_display",
+            (r.board, r.plu, r.store, r.name, r.price, r.qty, ts, r.store_display or r.store),
         )
     if observed is not None:
         for (board, plu, store), oldqty in prev.items():
