@@ -159,11 +159,12 @@ def apply_wake_snapshot(conn: sqlite3.Connection, rows: list[WakeStoreStock]) ->
         for r in conn.execute("SELECT plu, store, qty FROM wake_latest").fetchall()
     }
     for r in rows:
-        conn.execute(
-            "INSERT OR IGNORE INTO wake_stock (plu, name, price, store, qty, observed_at) VALUES (?,?,?,?,?,?)",
-            (r.plu, r.name, r.price, r.store, r.qty, ts),
-        )
         old = prev.get((r.plu, r.store))
+        if old != r.qty:  # history records changes, not re-readings of the same number
+            conn.execute(
+                "INSERT OR IGNORE INTO wake_stock (plu, name, price, store, qty, observed_at) VALUES (?,?,?,?,?,?)",
+                (r.plu, r.name, r.price, r.store, r.qty, ts),
+            )
         if r.store != "__ALL__" and r.qty > 0 and (old is None or old == 0):
             events.append(
                 Event(
@@ -211,12 +212,13 @@ def apply_board_snapshot(
     }
     present = {(r.board, r.plu, r.store) for r in rows}
     for r in rows:
-        conn.execute(
-            "INSERT OR IGNORE INTO board_stock (board, plu, name, price, store, qty, observed_at) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (r.board, r.plu, r.name, r.price, r.store, r.qty, ts),
-        )
         old = prev.get((r.board, r.plu, r.store))
+        if old != r.qty:  # history records changes, not re-readings of the same number
+            conn.execute(
+                "INSERT OR IGNORE INTO board_stock (board, plu, name, price, store, qty, observed_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (r.board, r.plu, r.name, r.price, r.store, r.qty, ts),
+            )
         if r.qty > 0 and (old is None or old == 0):
             price = f", {r.price}" if r.price else ""
             where = r.store_display or r.store  # stable key vs. human label
