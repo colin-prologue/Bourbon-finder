@@ -1105,6 +1105,32 @@ def test_render_site_writes_a_self_contained_page(tmp_path):
     assert "data.json" in html
 
 
+def test_page_never_interpolates_feed_values_into_markup():
+    """Product names, prices and store labels are scraped from remote feeds and
+    stored verbatim. Building markup from them — even inside an attribute like
+    aria-label — is stored DOM XSS for every visitor once one feed serves a
+    crafted name. Structure may be markup; feed values go through textContent
+    and dataset.
+
+    Guards the shape rather than the symptom: no `${...}` substitution may
+    appear inside an innerHTML assignment.
+    """
+    import re
+
+    html = (Path("ncbourbon/templates/index.html")).read_text()
+    script = html.split("<script>", 1)[1]
+    offenders = [
+        line.strip()
+        for line in script.splitlines()
+        if "innerHTML" in line and "=" in line and "${" in line
+    ]
+    assert not offenders, f"template literal interpolated into innerHTML: {offenders}"
+
+    # The multi-line assignments must also be free of interpolation.
+    for block in re.findall(r"innerHTML\s*=\s*(.+?);", script, re.S):
+        assert "${" not in block, f"interpolated innerHTML block:\n{block}"
+
+
 def test_board_history_records_changes_not_rereadings(monkeypatch):
     """board_stock is history; re-polling an unchanged shelf must not append.
 

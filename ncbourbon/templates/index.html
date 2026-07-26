@@ -144,6 +144,29 @@ function ago(iso) {
   return Math.round(h / 24) + "d ago";
 }
 
+function empty(message) {
+  const p = document.createElement("p");
+  p.className = "empty";
+  p.textContent = message;
+  return p;
+}
+
+// One row of "qty · board · label". Built through the DOM so no scraped value
+// is ever parsed as markup.
+function storeRow(qty, board, label) {
+  const li = document.createElement("li");
+  const q = document.createElement("span");
+  q.className = "qty";
+  q.textContent = qty;
+  const b = document.createElement("span");
+  b.className = "board";
+  b.textContent = board;
+  const l = document.createElement("span");
+  l.textContent = label;
+  li.append(q, b, l);
+  return li;
+}
+
 function matches(item, q) {
   if (starredOnly && !watch.has(item.nc_code)) return false;
   if (!q) return true;
@@ -158,35 +181,41 @@ function renderShelf() {
   const host = $("#shelf");
   host.innerHTML = "";
   if (!items.length) {
-    host.innerHTML = `<p class="empty">${
+    host.appendChild(empty(
       DATA.shelf.length ? "Nothing matches that filter."
                         : "Nothing from the watchlist is on a shelf right now."
-    }</p>`;
+    ));
     return;
   }
   for (const item of items) {
     const el = document.createElement("article");
     el.className = "item";
-    const price = item.price ? " · " + item.price : "";
     const plural = item.stores.length === 1 ? "store" : "stores";
-    el.innerHTML = `
-      <header>
-        <button class="star" aria-pressed="${watch.has(item.nc_code)}"
-                aria-label="Watch ${item.name}" data-code="${item.nc_code}">★</button>
-        <span class="name"></span>
-        <span class="meta">${item.total} across ${item.stores.length} ${plural}</span>
-      </header>
-      <div class="meta">NC ${item.nc_code}${price}${item.allocated ? " · allocated list" : ""}</div>
-      <ul class="stores"></ul>`;
+    // Product names, prices and store labels are scraped from remote feeds and
+    // stored verbatim. Interpolating them into innerHTML — even inside an
+    // attribute like aria-label — lets a crafted name escape and become live
+    // DOM for every visitor. Structure is markup; feed values go through
+    // textContent and dataset, never through a template string.
+    el.innerHTML =
+      '<header><button class="star">★</button><span class="name"></span>' +
+      '<span class="meta count"></span></header>' +
+      '<div class="meta ident"></div><ul class="stores"></ul>';
+
+    const star = el.querySelector(".star");
+    star.setAttribute("aria-pressed", String(watch.has(item.nc_code)));
+    star.setAttribute("aria-label", "Watch " + item.name);
+    star.dataset.code = item.nc_code;
+
     el.querySelector(".name").textContent = item.name;
+    el.querySelector(".count").textContent =
+      `${item.total} across ${item.stores.length} ${plural}`;
+    el.querySelector(".ident").textContent =
+      `NC ${item.nc_code}` + (item.price ? " · " + item.price : "") +
+      (item.allocated ? " · allocated list" : "");
+
     const ul = el.querySelector(".stores");
     for (const s of [...item.stores].sort((a, b) => b.qty - a.qty)) {
-      const li = document.createElement("li");
-      li.innerHTML = `<span class="qty">${s.qty}</span><span class="board">${s.board}</span>`;
-      const label = document.createElement("span");
-      label.textContent = s.label;
-      li.appendChild(label);
-      ul.appendChild(li);
+      ul.appendChild(storeRow(s.qty, s.board, s.label));
     }
     host.appendChild(el);
   }
@@ -206,19 +235,18 @@ function renderChanges() {
     return seen.has(k) ? false : seen.add(k);
   }).slice(0, 30);
   if (!rows.length) {
-    host.innerHTML = `<p class="empty">Nothing moved in the last ${DATA.window_hours} hours.</p>`;
+    host.innerHTML = "";
+    host.appendChild(empty(`Nothing moved in the last ${DATA.window_hours} hours.`));
     return;
   }
   const ul = document.createElement("ul");
   ul.className = "stores";
   for (const c of rows) {
-    const li = document.createElement("li");
-    li.innerHTML = `<span class="qty">${c.kind === "on_shelf" ? "+" + c.qty : "—"}</span>
-                    <span class="board">${c.board}</span>`;
-    const label = document.createElement("span");
-    label.textContent = `${c.name} · ${c.label} · ${ago(c.at)}`;
-    li.appendChild(label);
-    ul.appendChild(li);
+    ul.appendChild(storeRow(
+      c.kind === "on_shelf" ? "+" + c.qty : "—",
+      c.board,
+      `${c.name} · ${c.label} · ${ago(c.at)}`,
+    ));
   }
   host.innerHTML = "";
   host.appendChild(ul);
@@ -229,25 +257,39 @@ function renderWarehouse() {
   t.innerHTML = "<tr><th>Cases</th><th>7d</th><th>Product</th><th>Type</th></tr>";
   for (const w of DATA.warehouse) {
     const tr = document.createElement("tr");
-    const move = w.delta ? `<span class="${w.delta < 0 ? "down" : ""}">${w.delta > 0 ? "+" : ""}${w.delta}</span>` : "";
-    tr.innerHTML = `<td class="num">${w.cases}</td><td class="num">${move}</td>
-                    <td></td><td class="meta">${w.listing_type}</td>`;
-    tr.children[2].textContent = w.name;
+    tr.innerHTML =
+      '<td class="num cases"></td><td class="num move"></td>' +
+      '<td class="prod"></td><td class="meta type"></td>';
+    tr.querySelector(".cases").textContent = w.cases;
+    if (w.delta) {
+      const span = document.createElement("span");
+      if (w.delta < 0) span.className = "down";
+      span.textContent = (w.delta > 0 ? "+" : "") + w.delta;
+      tr.querySelector(".move").appendChild(span);
+    }
+    tr.querySelector(".prod").textContent = w.name;
+    tr.querySelector(".type").textContent = w.listing_type;
     t.appendChild(tr);
   }
 }
 
 function renderSources() {
-  $("#sources").innerHTML = DATA.sources.map(s =>
-    `<span class="chip${s.stale ? " stale" : ""}">${s.source} · ${ago(s.last_ok)}${
-      s.failures ? " · " + s.failures + " failures" : ""}</span>`).join("");
+  const host = $("#sources");
+  host.innerHTML = "";
+  for (const s of DATA.sources) {
+    const chip = document.createElement("span");
+    chip.className = "chip" + (s.stale ? " stale" : "");
+    chip.textContent = `${s.source} · ${ago(s.last_ok)}` +
+      (s.failures ? ` · ${s.failures} failures` : "");
+    host.appendChild(chip);
+  }
 }
 
 fetch("data.json", { cache: "no-store" })
   .then(r => r.json())
   .then(d => {
     DATA = d;
-    $("#asof").innerHTML =
+    $("#asof").textContent =
       `Updated ${ago(d.generated_at)}. Boards refresh a couple of times a day — ` +
       `this is a picture, not a live feed.`;
     renderSources();
