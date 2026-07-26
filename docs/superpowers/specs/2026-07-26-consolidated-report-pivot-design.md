@@ -20,7 +20,9 @@ Two days accounted for 5,959 of those: 4,321 on 2026-07-22 and 1,638 on
 2026-07-24. That is not a notification stream, it is a denial-of-service on
 one's own inbox, and it is why nothing in it gets acted on.
 
-Four distinct causes, each fixable:
+Five distinct causes, each fixable. The first four were diagnosed up front; the
+fifth was found while implementing and is about what the tool *collects* rather
+than what it sends:
 
 ### 1. No relevance filter on the board leg
 
@@ -63,6 +65,34 @@ warehouse_snapshot   248,698 rows   48 MB of a 53 MB database   (6 days)
 This is unrelated to the notification problem on its face, but it is the thing
 that makes any always-current shared surface impossible, so it gets fixed
 first.
+
+### 5. A silent blind spot in what gets collected at all
+
+Found while implementing, not in the original diagnosis, and the most
+consequential of the five for what the tool is actually for.
+
+A board is only ever asked about products we name. Search terms came from
+Allocation/Limited rows in `stock_latest` alone, so of 312 codes in the watch
+universe, **129 (41%) were never searched** — 119 on the state's allocated list
+but not currently flagged in the warehouse, 10 matched only by `name_patterns`.
+Such a product could sit in the watchlist, appear in the report's universe, and
+never once be collected.
+
+Worse, the term list was capped with `sorted(terms)[:80]`. The truncation is
+*alphabetical*, so it dropped the same 15 brands on every run since the cap was
+added:
+
+```
+Uncle Nearest · Very Old · Weller (×6) · Widow Jane · Wild Turkey
+Willett Wheated · Woodford Reserve · Wyoming Whiskey · Yellowstone Small
+```
+
+Weller is Allocation-flagged and had **never once been searched on any board**.
+A cap on an alphabetically sorted list is not sampling; it is a permanent blind
+spot at the end of the alphabet.
+
+The four causes above make the tool unreadable. This one makes it quietly
+incomplete, which is worse: nothing about the output suggests a gap.
 
 ## What we are actually building
 
@@ -211,21 +241,46 @@ deployment history.
 
 Stacked — each PR bases on the previous one. Review order is merge order.
 
-1. **`fix/write-amplification`** — insert a `warehouse_snapshot` row only when
-   `total_available` actually changed for that code (or the report_date is
-   new). Add a retention prune and `VACUUM`. Stops the repo bleeding and makes
-   the DB small enough to serve from.
-2. **`fix/alert-noise`** — restrict board events to watchlist codes; aggregate
-   to one event per `(board, product)` carrying every store; suppress
-   first-run baseline storms; cap daily volume.
+1. **`fix/write-amplification`** — re-key `warehouse_snapshot` to
+   `(nc_code, report_date)`, since the warehouse report is a daily artifact,
+   and collapse existing rows to the last reading of each day: 248,698 rows →
+   19,131, 51MB → 5.9MB. Board and Wake history record *transitions* rather
+   than states (`prev_qty`), so a sale can be told from an arrival. A Wake
+   total sellout clears the per-store rows it leaves behind. Retention prune
+   and `VACUUM`.
+2. **`fix/alert-noise`** — restrict board events to the watch universe;
+   aggregate to one event per `(board, product)` carrying every store; record
+   seeding explicitly per scope; derive board search terms from the *whole*
+   universe and remove the alphabetical term cap; cap daily volume on
+   delivered mail.
 3. **`feat/report`** — `report.py`, `ncbourbon report`, digest rewritten on
-   top of it.
-4. **`feat/site`** — `ncbourbon render-site` and the static page.
-5. **`feat/publish`** — Pages deploy, `[[subscribers]]`, schedule retune.
+   top of it. Resolves name-patterns against stored names so the report and
+   the alerting agree on what is watched.
+4. **`feat/site`** — `ncbourbon render-site` and the static page, with the
+   report embedded so it works opened straight off disk.
+5. **`feat/publish`** — Pages deploy, subscribers, and the schedule fix.
 
 Branches 1 and 2 are independently valuable: merging only those cuts email
-volume by roughly two orders of magnitude and stops the database growth, even
-if the site is never shipped.
+volume by roughly two orders of magnitude, stops the database growth, and
+closes the coverage blind spot — even if the site is never shipped.
+
+### Two invariants that emerged during implementation
+
+Neither was in the original design; both are now load-bearing, and both were
+found by running the thing rather than reading it.
+
+**History records transitions, not states.** Storing only the new quantity made
+`4 → 2` (a sale) indistinguishable from `0 → 4` (an arrival), so one restock
+followed by two sales rendered as "3 appeared" — the per-store fan-out this
+pivot exists to remove, reappearing one layer up in the report.
+
+**A first sighting is only news if coverage did not change.** A code never seen
+on a board is ambiguous: it just landed, or we just started looking. Search
+terms are derived from the allocated list, which the state updates on its own,
+so coverage shifts without anyone touching the config — and each shift
+announced already-shelved bottles as fresh restocks. Both board and Wake polls
+now fingerprint their term set: unchanged fingerprint means a first sighting is
+a genuine arrival; changed means newly-covered ground, collected but silent.
 
 ## Risks and open questions
 
@@ -242,7 +297,19 @@ if the site is never shipped.
 - **History rewrite is not in scope.** Branch 1 stops future growth; the 166 MB
   already in `.git` stays unless you decide to rewrite history, which is
   destructive and needs your call.
-- **`actions/deploy-pages` vs. a force-pushed `gh-pages` branch.** The former
-  is cleaner and adds no commits; it requires Pages to be set to "GitHub
-  Actions" as its source, which is a one-time setting only you can change.
-  Branch 5 assumes it and documents the fallback.
+- **`actions/deploy-pages` requires a one-time manual setting.** Pages → Source
+  must be set to "GitHub Actions"; no workflow can do it. Branch 5 assumes it
+  and says so in both the workflow and the README. Until it is set, the deploy
+  job is the only part of the stack that does nothing.
+- **Politeness posture changed, deliberately.** Closing the coverage blind spot
+  takes board requests from ~720/day to ~1,350/day across three boards at three
+  polls a day. The README's politeness section reasons about cadence rather
+  than volume, and this is still one request per term per board on public
+  government pages at a few polls a day — but it is a real increase and was
+  Colin's explicit call, not a default.
+- **Durham remains knowingly incomplete.** `sources/durham.py` caps at 60
+  matched codes per run, logged as a warning. Widening the terms took its match
+  count from 295 to 482, so it now covers roughly 12% rather than 20%. Tracked
+  separately; the cap predates this work. Until it is addressed, Durham shelf
+  data is thinner than the site implies, and the shortfall is visible only in a
+  log line.
