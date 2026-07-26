@@ -78,9 +78,14 @@ jobs:
             echo "stocks=$stocks"
             echo "boards=$boards"
             echo "daily=$daily"
-            # The site is worth republishing whenever shelf data could have
-            # moved, which is the board and daily runs — not every 20 minutes.
-            if [ "$boards" = true ] || [ "$daily" = true ]; then
+            # Republish after any loop that ran. Shelf data only moves three
+            # times a day, but warehouse Total Available falls through the day
+            # as boards order, and that drawdown is the only forward-looking
+            # signal left since the shipment feed was retired — a page showing
+            # an eight-hour-old one while claiming to be the current picture
+            # would undercut the point of having a page. Three deploys an hour
+            # sits well under the Pages rate limit.
+            if [ "$stocks" = true ] || [ "$boards" = true ] || [ "$daily" = true ]; then
               echo "publish=true"
             else
               echo "publish=false"

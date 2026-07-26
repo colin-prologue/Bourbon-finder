@@ -1203,6 +1203,29 @@ def test_digest_mails_each_subscriber_their_own_copy(monkeypatch):
     assert "nothing on shelves" in sent[1][1].lower()   # their filter matched nothing
 
 
+def test_digest_never_logs_a_subscriber_address(monkeypatch, caplog):
+    """This runs in Actions on a public repo, so the log is public — and GitHub
+    masks the NCBOURBON_SUBSCRIBERS secret as a whole, not the addresses inside
+    it. Logging one would undo the reason for using a secret at all."""
+    import logging
+
+    from ncbourbon import alerts as alerts_mod
+    from ncbourbon.config import AlertConfig, Config, Subscriber
+
+    monkeypatch.setattr(alerts_mod, "send_email", lambda cfg, subject, body: True)
+    cfg = Config()
+    cfg.wake.enabled = False
+    cfg.alerts = AlertConfig(smtp_host="x", to_addrs=["owner@example.com"])
+    cfg.subscribers = [
+        Subscriber(name="Neighbour", email="secret.person@example.com", boards=["greensboro"]),
+    ]
+    with caplog.at_level(logging.DEBUG):
+        alerts_mod.send_digest(_report_fixture_db(), cfg)
+
+    assert "secret.person@example.com" not in caplog.text
+    assert "Neighbour" in caplog.text          # still identifiable for debugging
+
+
 def test_board_history_records_changes_not_rereadings(monkeypatch):
     """board_stock is history; re-polling an unchanged shelf must not append.
 

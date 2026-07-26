@@ -102,8 +102,12 @@ reproducing public records, not anything official.
 
 ### Publishing it
 
-`poll.yml` renders and deploys to GitHub Pages after the board and daily runs
-(three or four times a day — the shelf data does not change faster than that).
+`poll.yml` renders and deploys to GitHub Pages after every poll. Shelf data only
+moves three times a day, but warehouse Total Available falls through the day as
+boards order, and that drawdown is the only forward-looking signal left since
+the shipment feed was retired — a page showing an eight-hour-old one while
+claiming to be the current picture would undercut the point of having a page.
+
 **One-time manual step:** repo Settings → Pages → Source → "GitHub Actions".
 There is no way to set that from a workflow.
 
@@ -128,7 +132,9 @@ means everything watched. With no subscribers configured it mails the whole
 report to `[alerts] to_addrs`, as before.
 
 Put addresses in the secret, not `config.toml` — **this repo is public and
-`config.toml` is committed to it**, and a neighbour's address is theirs.
+`config.toml` is committed to it**, and a neighbour's address is theirs. For the
+same reason nothing logs an address: Actions logs on a public repo are public,
+and GitHub masks the secret as a whole rather than the addresses inside it.
 
 ## Setup
 

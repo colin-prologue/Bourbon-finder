@@ -34,6 +34,11 @@ def send_email(cfg: AlertConfig, subject: str, body: str) -> bool:
                 s.login(cfg.smtp_user, cfg.smtp_password)
             s.send_message(msg)
         return True
+    except smtplib.SMTPRecipientsRefused as exc:
+        # This exception carries the rejected addresses. On a public repo the
+        # Actions log is public, so record only how many were refused.
+        log.error("email send failed: %d recipient(s) refused", len(exc.recipients))
+        return False
     except Exception:
         log.exception("email send failed")
         return False
@@ -110,4 +115,8 @@ def send_digest(conn: sqlite3.Connection, cfg) -> None:
         theirs = for_subscriber(report, sub)
         one = replace(cfg.alerts, to_addrs=[sub.email])
         send_email(one, _subject(theirs), render_text(theirs))
-        log.info("digest -> %s (%d products)", sub.email, len(theirs.shelf))
+        # Never log the address. This runs in Actions on a public repo, so the
+        # log is public, and GitHub masks the NCBOURBON_SUBSCRIBERS secret as a
+        # whole rather than the individual addresses inside it — logging one
+        # would undo the reason for putting them in a secret at all.
+        log.info("digest -> subscriber %r (%d products)", sub.name or "unnamed", len(theirs.shelf))
