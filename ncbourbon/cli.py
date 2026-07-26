@@ -116,9 +116,11 @@ def _watchlist_terms(conn, watch) -> list[str]:
     There is deliberately NO cap. The old `sorted(terms)[:80]` truncated
     alphabetically, so the same 15 brands were dropped on every single run —
     every Weller variant, Wild Turkey, Widow Jane, Willett, Woodford,
-    Yellowstone. Weller is Allocation-flagged and had never once been searched.
-    A cap on an alphabetically sorted list is not sampling, it is a permanent
-    blind spot at the end of the alphabet.
+    Yellowstone. Weller is Allocation-flagged and was invisible to every board
+    driven by this function, which is Durham and Greensboro. (Wake has its own
+    static `[wake] search_terms` including `weller`, so it was unaffected.) A cap
+    on an alphabetically sorted list is not sampling, it is a permanent blind
+    spot at the end of the alphabet.
     """
     terms: set[str] = set()
 

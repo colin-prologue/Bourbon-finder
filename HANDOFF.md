@@ -24,9 +24,12 @@ needs to continue is here or in the repo. (Deeper research lives in the claude.a
   - `warehouse_snapshot` re-keyed to one row per code per report day:
     248,698 → 19,131 rows, 51MB → 5.9MB. The DB is committed on every poll, so
     **the DB's size is the repo's size**. `ncbourbon prune` runs daily.
-  - **Weller had never once been searched on any board.** Terms were capped with
-    `sorted(terms)[:80]`, so truncation was alphabetical and permanently dropped
-    the same 15 brands. Cap removed; terms now cover the whole watch universe.
+  - **Weller was invisible to Durham and Greensboro.** `_watchlist_terms` capped
+    with `sorted(terms)[:80]`, so truncation was alphabetical and permanently
+    dropped the same 15 brands from every board driven by that path. Wake was
+    unaffected — it has its own static `[wake] search_terms` which includes
+    `weller` — so the gap covered the two largest in-range boards, not all
+    three. Cap removed; terms now cover the whole watch universe.
 - **The 166MB already in `.git` was NOT rewritten.** Future growth is fixed; the
   existing history stays unless Colin decides to rewrite it (destructive).
 - **Open: #15** (`fix/durham-coverage`, another session). Durham's 60-code cap
@@ -70,7 +73,11 @@ The pipeline is: supplier → Raleigh state warehouse → local board → store 
   - **Seeding and coverage changes are silent.** A scope's first complete observation is a baseline (recorded in the `seeded` table, never inferred from stored rows). A first sighting only counts as an arrival if the search-term fingerprint is unchanged; otherwise we merely started looking.
 - Join key everywhere = **NC Code, dashless** (e.g. `20624`). Warehouse "NC Code", Wake "PLU", ABC/GO "Code", Durham `/products/<code>` are all the same number. `catalog.normalize_nc_code()` folds the dashed pricing form ("18-650") to dashless.
 - `cli.py::_watchlist_terms()` derives search terms from the WHOLE watch universe — Allocation/Limited brands, the state's allocated list, and the literal runs of each `name_pattern` (they are regexes; board endpoints do substring search, so they cannot be sent verbatim). **There is deliberately no cap**: the old `sorted(terms)[:80]` truncated alphabetically and permanently hid every Weller. ~150 terms, ~1,350 requests/day across three boards.
-- A source that reports absence rather than an explicit zero will strand stale stock forever. Durham renders no store table when nothing is carried; Wake emits a single `__ALL__` zero row; ABC/GO omits sold-out items entirely. All three need the sellout handled explicitly — **check this first on any new adapter.** Greensboro reports per-store zeros and is immune.
+- A source that reports absence rather than an explicit zero will strand stale stock forever — **check this first on any new adapter.** Three shapes seen, and they are NOT all fixed:
+  - **ABC/GO** omits sold-out items entirely. Handled: `recheck_absent` re-queries and passes `observed` (issue #2).
+  - **Wake** emits a single `__ALL__` zero row rather than per-store zeros. Handled: `apply_wake_snapshot` clears that product's per-store rows.
+  - **Durham** renders *no store table at all* when no store carries the product. **NOT handled on `main`.** `fetch_durham_stock` returns no rows for it and `cmd_poll_boards` never adds Durham codes to `observed`, so the previous positive `board_latest` rows are left standing: a Durham bottle that sells out everywhere shows as in stock indefinitely and can never fire `0 -> >0` again. Fixed in **#15**, still open.
+  - **Greensboro** reports per-store zeros and is immune.
 
 ## HOW TO ADD A BOARD (the repeatable recipe)
 Each board is ~100–130 lines. Two shapes seen so far; pick whichever the site uses.
@@ -84,7 +91,9 @@ Each board is ~100–130 lines. Two shapes seen so far; pick whichever the site 
    item disappears entirely rather than showing 0 — this is how ABC/GO behaves), you cannot observe
    the zero directly: the poll must re-query previously-in-stock codes and pass an `observed` scope
    to `apply_board_snapshot` so it can persist the sellout. See `abcgo.recheck_absent` + issue #2.
-   (Durham and Greensboro list 0-qty stores directly, so they need no re-query.)
+   (Greensboro lists 0-qty stores directly and needs no re-query. Durham does
+   NOT: a product no store carries renders with no store table at all, so it
+   yields no rows and needs `observed` like ABC/GO — see #15.)
 3. **Wire into `cmd_poll_boards`** (a few lines, same pattern as the Durham block) + a `[boards]` toggle in `config.py` and `config.example.toml`.
 4. **Add tests** to `tests/test_parsers.py`: one pure-parse test against a captured HTML/JSON fixture (include an out-of-stock store → qty 0), and one end-to-end with a fake `session`/`fetch` (see `test_durham_fetch_end_to_end` and `test_abcgo_details_to_stock` as templates).
 5. Politeness: 1 request per term + 1 per matched code; dedupe codes; cap detail fetches; descriptive User-Agent. Poll a few times/day.

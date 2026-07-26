@@ -639,8 +639,9 @@ def test_partial_wake_run_does_not_seed():
 def test_board_search_terms_cover_the_whole_watch_universe():
     """A board is only ever asked about products we name, so a gap between the
     universe and the search terms is a silent blind spot. The old
-    sorted(terms)[:80] cut alphabetically, so Weller — Allocation-flagged — had
-    never once been searched."""
+    sorted(terms)[:80] cut alphabetically, so Weller — Allocation-flagged — was
+    invisible to every board driven by this function (Durham and Greensboro).
+    Wake has its own static term list and was unaffected."""
     from ncbourbon.cli import _watchlist_terms
     from ncbourbon.config import WatchConfig
     from ncbourbon.db import connect
