@@ -158,6 +158,32 @@ def test_migration_collapses_legacy_intraday_rows(tmp_path):
     assert conn2.execute("SELECT COUNT(*) FROM warehouse_snapshot").fetchone()[0] == 2
 
 
+def test_wake_price_change_is_not_lost_when_quantity_holds(monkeypatch):
+    """History records changes, not re-readings — but a repriced bottle at an
+    unchanged quantity is a change, and wake_latest is the only other place the
+    price could land."""
+    from ncbourbon import diff as diff_mod
+    from ncbourbon.db import connect
+    from ncbourbon.diff import apply_wake_snapshot
+    from ncbourbon.sources.wake import WakeStoreStock
+
+    clock = iter(f"2026-07-2{d}T00:00:00Z" for d in range(1, 9))
+    monkeypatch.setattr(diff_mod, "now_iso", lambda: next(clock))
+
+    conn = connect(":memory:")
+    apply_wake_snapshot(conn, [WakeStoreStock("27090", "Blanton's", "$65.95", "s1", 2)])
+    # Same quantity, new price.
+    apply_wake_snapshot(conn, [WakeStoreStock("27090", "Blanton's", "$79.95", "s1", 2)])
+
+    assert conn.execute("SELECT price FROM wake_latest").fetchone()[0] == "$79.95"
+    assert [r[0] for r in conn.execute(
+        "SELECT price FROM wake_stock ORDER BY observed_at"
+    )] == ["$65.95", "$79.95"]
+    # An identical re-reading still writes nothing.
+    apply_wake_snapshot(conn, [WakeStoreStock("27090", "Blanton's", "$79.95", "s1", 2)])
+    assert conn.execute("SELECT COUNT(*) FROM wake_stock").fetchone()[0] == 2
+
+
 def test_prune_drops_history_past_the_horizon(tmp_path):
     from ncbourbon.db import prune
 

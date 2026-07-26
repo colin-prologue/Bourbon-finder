@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS wake_latest (
   name TEXT,
   qty INTEGER,
   updated_at TEXT,
+  price TEXT,          -- as board_latest carries it; see _migrate()
   PRIMARY KEY (plu, store)
 );
 CREATE TABLE IF NOT EXISTS allocated_list (
@@ -125,6 +126,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
     one database, it lives on one machine (plus the copy in CI), and a
     version table would be more moving parts than the thing it versions.
     """
+    # wake_latest gained `price` so a price-only change is still observable.
+    # History now records changes rather than re-readings, and quantity alone
+    # was the comparison — so a repriced bottle at an unchanged quantity wrote
+    # nothing to wake_stock and had nowhere else to land. board_latest already
+    # carried price; this makes the two paths agree.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(wake_latest)")}
+    if "price" not in cols:
+        conn.execute("ALTER TABLE wake_latest ADD COLUMN price TEXT")
+        conn.commit()
+
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='warehouse_snapshot'"
     ).fetchone()

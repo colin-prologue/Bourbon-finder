@@ -155,12 +155,16 @@ def apply_wake_snapshot(conn: sqlite3.Connection, rows: list[WakeStoreStock]) ->
     events: list[Event] = []
     ts = now_iso()
     prev = {
-        (r["plu"], r["store"]): r["qty"]
-        for r in conn.execute("SELECT plu, store, qty FROM wake_latest").fetchall()
+        (r["plu"], r["store"]): (r["qty"], r["price"])
+        for r in conn.execute("SELECT plu, store, qty, price FROM wake_latest").fetchall()
     }
     for r in rows:
-        old = prev.get((r.plu, r.store))
-        if old != r.qty:  # history records changes, not re-readings of the same number
+        old_qty, old_price = prev.get((r.plu, r.store), (None, None))
+        old = old_qty
+        # History records changes, not re-readings of the same numbers. Price is
+        # part of "the same numbers": a repriced bottle at an unchanged quantity
+        # is still a change, and dropping it would lose the new price entirely.
+        if (old_qty, old_price) != (r.qty, r.price):
             conn.execute(
                 "INSERT OR IGNORE INTO wake_stock (plu, name, price, store, qty, observed_at) VALUES (?,?,?,?,?,?)",
                 (r.plu, r.name, r.price, r.store, r.qty, ts),
@@ -177,10 +181,10 @@ def apply_wake_snapshot(conn: sqlite3.Connection, rows: list[WakeStoreStock]) ->
                 )
             )
         conn.execute(
-            "INSERT INTO wake_latest (plu, store, name, qty, updated_at) VALUES (?,?,?,?,?) "
+            "INSERT INTO wake_latest (plu, store, name, qty, updated_at, price) VALUES (?,?,?,?,?,?) "
             "ON CONFLICT(plu, store) DO UPDATE SET qty=excluded.qty, name=excluded.name, "
-            "updated_at=excluded.updated_at",
-            (r.plu, r.store, r.name, r.qty, ts),
+            "updated_at=excluded.updated_at, price=excluded.price",
+            (r.plu, r.store, r.name, r.qty, ts, r.price),
         )
     conn.commit()
     return events
