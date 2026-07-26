@@ -6,35 +6,44 @@ needs to continue is here or in the repo. (Deeper research lives in the claude.a
 
 ## TL;DR — where things stand
 - Working tool that watches NC's liquor system for Allocation/Limited bourbon.
-- **In flight (2026-07-26): the pivot from email-push to a pulled board.** Five
-  stacked PRs, #10 → #14, designed in #9 (`docs/superpowers/specs/2026-07-26-*`).
-  Read the spec first. In merge order: stop snapshot write amplification; fix
-  alert noise; add `report.py`; add the static site; publish to Pages + fix the
-  Actions schedule. Nothing is merged yet — awaiting Colin's review.
-- **The alert firehose is the thing being fixed.** Six days of production sent
-  5,994 emails, ~97% noise: no relevance filter on the board leg, one event per
-  store instead of per product, and baseline-seeding storms. See #11.
-- **`poll-boards` and `poll-catalog` were silently not running.** `poll.yml`
-  decided what to run by reading the clock; Actions cron drift meant the window
-  was almost never hit. Boards last succeeded 2026-07-24, catalog 2026-07-22,
-  while the workflow reported success every 20 minutes. Fixed in #14 by keying
-  dispatch on `github.event.schedule`.
-- **The DB is committed to git, so its size is the repo's size.** `.git` hit
-  166MB in five days. #10 re-keys `warehouse_snapshot` to one row per code per
-  day (248,698 → 19,131 rows; 51MB → 5.9MB) and adds `ncbourbon prune`. The
-  history already written is NOT rewritten — that needs Colin's call.
-- **Status: board leg shipped and live on `main`.** `poll-boards` (PRs #1/#3) has per-store adapters for New Hanover (ABC/GO), Durham, and Greensboro; the ABC/GO sellout→missed-restock bug is fixed (issue #2, PR #4).
-- **41/41 tests pass** (`python -m pytest tests/ -q`). Local `.venv` is Python 3.14 (fine — code needs 3.11+ for stdlib `tomllib`); `pip install -r requirements.txt` + `pip install pytest` into it.
+- **The pivot from email-push to a pulled board is DONE and live** (2026-07-26).
+  PRs #9–#14 all merged. Design: `docs/superpowers/specs/2026-07-26-consolidated-report-pivot-design.md`
+  — read it first; it carries the reasoning, not just the what.
+- **The site is live:** https://colin-prologue.github.io/Bourbon-finder/
+  Rendered by `ncbourbon render-site` and deployed from `poll.yml` after every
+  poll. `noindex`, no accounts, watchlists in `localStorage`, shareable via a
+  `#w=` fragment. Neighbours just need the link.
+- **What the pivot fixed**, all verified against production data:
+  - Six days had sent 5,994 emails, ~97% noise. Board events are now filtered to
+    the watch universe and aggregated one-per-product-per-board: 1,636 in-stock
+    store rows collapse to 13 products.
+  - `poll-boards` and `poll-catalog` were **silently not running** — `poll.yml`
+    picked loops by reading the clock and cron drift meant the window was almost
+    never hit, while every run reported success. Now keyed on
+    `github.event.schedule`.
+  - `warehouse_snapshot` re-keyed to one row per code per report day:
+    248,698 → 19,131 rows, 51MB → 5.9MB. The DB is committed on every poll, so
+    **the DB's size is the repo's size**. `ncbourbon prune` runs daily.
+  - **Weller had never once been searched on any board.** Terms were capped with
+    `sorted(terms)[:80]`, so truncation was alphabetical and permanently dropped
+    the same 15 brands. Cap removed; terms now cover the whole watch universe.
+- **The 166MB already in `.git` was NOT rewritten.** Future growth is fixed; the
+  existing history stays unless Colin decides to rewrite it (destructive).
+- **Open: #15** (`fix/durham-coverage`, another session). Durham's 60-code cap
+  was applied to an unfiltered alphabetical list and reached **3 of 11**
+  watch-universe codes. Needs one rebase onto `main`.
+- **66/66 tests pass** (`python -m pytest tests/ -q`). Fixtures build into the
+  gitignored `tests/fixtures/_build/`, so a test run no longer dirties the tree. Local `.venv` is Python 3.14 (fine — code needs 3.11+ for stdlib `tomllib`); `pip install -r requirements.txt` + `pip install pytest` into it.
 - The big change (2026-07): the state's warehouse→board shipment feed (StockShipped) was **retired by NC ABC**, so the "board leg" was rebuilt as direct per-store polling of individual board sites (`poll-boards`).
 - **Boards with working store-level adapters:** Wake (own site), Durham (own site), Greensboro (SuiteCommerce) — the **active, in-range set**. New Hanover (ABC/GO) is built and works but is **back-burnered** (see scope below).
 - **Scope (added 2026-07-26):** only poll boards within ~1.5h drive of Hillsborough. Active: **Durham, Wake, Greensboro**. Out of range → future expansion, not polled: **New Hanover** (~2.5h, Wilmington) and **Mecklenburg** (~2.5h, Charlotte). `abcgo_boards` is now empty by default; the ABC/GO adapter + New Hanover stay in the code for if we ever want them.
-- **Next work:** review and merge #10–#14 in order. In-range new-board coverage
-  is exhausted (Orange/Alamance have no pollable feed; see roadmap), so favour
-  correctness and the pull surface over more board hunts. Greensboro store-name
-  enrichment landed on `main` (f2157bf) and now survives into the report via
-  `board_latest.store_display`.
-- **Known, unfixed:** `durham` silently caps at 60 of ~295 matched codes per run
-  (logged as a warning). Worth deciding whether to page through the rest.
+- **Next work:** in-range new-board coverage is exhausted (Orange/Alamance have
+  no pollable feed; see roadmap), so favour correctness and the pull surface over
+  more board hunts. Greensboro store-name enrichment is live and survives into
+  the report via `board_latest.store_display`.
+- **Known, unfixed:** Durham coverage (see #15). Also note the report is only as
+  fresh as the last poll — boards refresh ~2x/day, so every surface says so
+  explicitly rather than implying live data.
 
 ## Dev environment / workflow (native, on this machine)
 - Python 3.11+ required (`config.py` uses stdlib `tomllib`). Recreate the venv locally if needed — the checked-in `.venv` points at a macOS 3.14 framework path and may be stale.
@@ -54,9 +63,14 @@ The pipeline is: supplier → Raleigh state warehouse → local board → store 
 
 ### Data model
 - `sources/*.py` — one module per source. Board adapters return `abcgo.BoardStoreStock(board, plu, name, price, store, qty)`.
-- `diff.py::apply_board_snapshot()` — writes `board_stock` (history) + `board_latest` (dedupe), emits `board_restock` on any (board, plu, store) going 0 → >0. Shared by ALL board adapters.
+- `diff.py::apply_board_snapshot()` — writes `board_stock` (history) + `board_latest` (current). Shared by ALL board adapters. Four rules govern it, each learned from a real failure:
+  - **History records transitions, not states.** Rows carry `prev_qty`, so a reader can tell `0 -> 4` (an arrival) from `4 -> 2` (a sale). Without it the report called both an appearance.
+  - **One event per (board, code)**, never per store, with every affected store in the body. Per-store keys also defeated the cooldown, which keys on them.
+  - **Only the watch universe alerts.** Every row is still persisted — the report and site want the whole picture — but board search returns ~10x more products than anyone watches.
+  - **Seeding and coverage changes are silent.** A scope's first complete observation is a baseline (recorded in the `seeded` table, never inferred from stored rows). A first sighting only counts as an arrival if the search-term fingerprint is unchanged; otherwise we merely started looking.
 - Join key everywhere = **NC Code, dashless** (e.g. `20624`). Warehouse "NC Code", Wake "PLU", ABC/GO "Code", Durham `/products/<code>` are all the same number. `catalog.normalize_nc_code()` folds the dashed pricing form ("18-650") to dashless.
-- `cli.py::cmd_poll_boards()` derives search terms from the live Allocation/Limited watchlist (`_watchlist_terms`, first 2 words of each brand) unless `[boards] search_terms` is set, then fans out to every ABC/GO board in `[boards] abcgo_boards` plus Durham (`[boards] durham`).
+- `cli.py::_watchlist_terms()` derives search terms from the WHOLE watch universe — Allocation/Limited brands, the state's allocated list, and the literal runs of each `name_pattern` (they are regexes; board endpoints do substring search, so they cannot be sent verbatim). **There is deliberately no cap**: the old `sorted(terms)[:80]` truncated alphabetically and permanently hid every Weller. ~150 terms, ~1,350 requests/day across three boards.
+- A source that reports absence rather than an explicit zero will strand stale stock forever. Durham renders no store table when nothing is carried; Wake emits a single `__ALL__` zero row; ABC/GO omits sold-out items entirely. All three need the sellout handled explicitly — **check this first on any new adapter.** Greensboro reports per-store zeros and is immune.
 
 ## HOW TO ADD A BOARD (the repeatable recipe)
 Each board is ~100–130 lines. Two shapes seen so far; pick whichever the site uses.
@@ -115,16 +129,17 @@ Pattern: only metro e-commerce boards whose platform exposes allocated bottles +
 - Broker Name on the warehouse report is the supplier's sales rep (a person), NOT a store — irrelevant to routing. It is already absent from the alert email body.
 
 ## Immediate next steps
-- **Review the pivot stack #10 → #14, in that order** (design in #9). They are
-  stacked, so each PR's base is the previous branch; merging out of order will
-  fight you. #10 and #11 are independently valuable — merging just those cuts
-  email volume by roughly two orders of magnitude and stops the DB growth, even
-  if the site never ships.
-- **One manual step before #14 does anything visible:** repo Settings → Pages →
-  Source → "GitHub Actions". No workflow can set it.
-- Decide on the 166MB already in `.git`. #10 stops future growth but does not
-  rewrite history.
-- Decide whether the site should be public-linkable. It is `noindex`, carries a
-  "not affiliated with NC ABC" note, and adds no polling load — one poll serves
-  every reader — but sharing it is still a step beyond a personal tool.
-- No clean new-board targets remain (see roadmap). Optional future work: TTB COLA early warning, VA ABC (v2) per the research report, or the High Point Power BI route.
+- **#15 (`fix/durham-coverage`)** is the only open PR. It needs one rebase onto
+  `main` — its base moved repeatedly while the stack was draining. Durham
+  currently reaches 3 of 11 watch-universe codes, so it is the thinnest of the
+  three active boards.
+- **Watch the first full digest.** Nothing has yet exercised a complete
+  poll → report → email cycle on real data at the daily 09:07 UTC slot. That is
+  the pivot's actual claim and it is unverified end to end.
+- `catalog` health reads stale (last ok 2026-07-22) because the schedule bug
+  kept it from running. The first daily run after the fix should clear it; if it
+  does not, that is a real failure rather than the old silent one.
+- Decide on the 166MB already in `.git`. Future growth is fixed; rewriting the
+  existing history is destructive and needs Colin's call.
+- Optional future work: TTB COLA early warning, VA ABC (v2) per the research
+  report, or the High Point Power BI route.
