@@ -9,8 +9,9 @@ needs to continue is here or in the repo. (Deeper research lives in the claude.a
 - **Status: board leg shipped and live on `main`.** `poll-boards` (PRs #1/#3) has per-store adapters for New Hanover (ABC/GO), Durham, and Greensboro; the ABC/GO sellout→missed-restock bug is fixed (issue #2, PR #4).
 - **23/23 tests pass** (`python -m pytest tests/ -q`). Local `.venv` is Python 3.14 (fine — code needs 3.11+ for stdlib `tomllib`); `pip install -r requirements.txt` + `pip install pytest` into it.
 - The big change (2026-07): the state's warehouse→board shipment feed (StockShipped) was **retired by NC ABC**, so the "board leg" was rebuilt as direct per-store polling of individual board sites (`poll-boards`).
-- **Boards with working store-level adapters:** Wake (own site), New Hanover (ABC/GO), Durham (own site), Greensboro (SuiteCommerce).
-- **Next work:** new-board coverage via clean public APIs is largely exhausted (see roadmap below) — favor correctness/polish over more board hunts. Greensboro store-name enrichment is in progress on a side branch.
+- **Boards with working store-level adapters:** Wake (own site), Durham (own site), Greensboro (SuiteCommerce) — the **active, in-range set**. New Hanover (ABC/GO) is built and works but is **back-burnered** (see scope below).
+- **Scope (added 2026-07-26):** only poll boards within ~1.5h drive of Hillsborough. Active: **Durham, Wake, Greensboro**. Out of range → future expansion, not polled: **New Hanover** (~2.5h, Wilmington) and **Mecklenburg** (~2.5h, Charlotte). `abcgo_boards` is now empty by default; the ABC/GO adapter + New Hanover stay in the code for if we ever want them.
+- **Next work:** in-range new-board coverage is essentially exhausted (Orange/Alamance near Hillsborough have no pollable feed; see roadmap) — favor correctness/polish over more board hunts. Greensboro store-name enrichment is committed but stranded on a side branch (unpushed, needs rebase onto `main`).
 
 ## Dev environment / workflow (native, on this machine)
 - Python 3.11+ required (`config.py` uses stdlib `tomllib`). Recreate the venv locally if needed — the checked-in `.venv` points at a macOS 3.14 framework path and may be stale.
@@ -79,10 +80,11 @@ The nearby/metro boards were reconned this session; clean-API options are largel
 - **Orange** (`orangeabc.com`) — **SKIP.** WordPress brochure site; rare bourbon goes via an annual lottery (entries close Nov 30), nothing to poll.
 - **Alamance / Mebane / Burlington** — **SKIP.** Alamance Municipal ABC Board is a brochure page on `burlingtonnc.gov`; no online inventory search, no store site resolves.
 - **High Point (Guilford)** — **POOR FIT.** Shopify (`highpointabc.com`), but allocated bottles aren't in the catalog and per-store stock is locked in an embedded Power BI report — only worth it if someone takes on the brittle Power BI scrape.
-- **Mecklenburg (Charlotte)** — gated on `abctogo.com` (age-gate + CSRF); no public per-store feed.
+- **Mecklenburg (Charlotte)** — out of range (~2.5h) AND gated on `abctogo.com` (age-gate + CSRF); no public per-store feed. Future expansion only.
+- **New Hanover (Wilmington)** — built + working (ABC/GO), but **back-burnered**: ~2.5h from Hillsborough, out of practical driving range. `abcgo_boards=[]` disables it; re-add `"nh"` to re-enable.
 - **Untouched, likely nothing public:** Chatham, Granville, Franklin, Person, Johnston — small boards; expect brochure-only. Verify a pollable per-store feed exists before building.
 
-Pattern: only metro e-commerce boards whose platform exposes allocated bottles + per-store qty via API are buildable — Wake, New Hanover, Durham, Greensboro cover that set today.
+Pattern: only metro e-commerce boards whose platform exposes allocated bottles + per-store qty via API are buildable. Of those, the ones **in range** of Hillsborough are Wake, Durham, Greensboro (all active); New Hanover is buildable but out of range.
 
 ## Gotchas / lessons
 - Warehouse report for *today* (NC calendar day) can be empty until generated; `stocks.nc_today()` computes the date in America/New_York and `fetch_and_parse()` falls back to the previous day. Keep this — a UTC scheduler otherwise requests a not-yet-existing report.

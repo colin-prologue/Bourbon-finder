@@ -34,10 +34,11 @@ search_terms = ["blanton", "weller", "eh taylor", "eagle rare", "stagg", "van wi
 # watch_boards is legacy/unused, kept only for if the state ever restores that feed.
 watch_boards = ["Wake", "Durham", "Mecklenburg", "Orange", "Chapel Hill"]
 # ABC/GO per-store inventory: board subdomains of abcgo.app to poll (public, no login).
-# Only New Hanover ("nh") was live/public as of 2026-07-22; add subdomains as boards
-# come online (the platform advertises "new locations daily"). Wake/Meck are NOT here
-# (Wake has its own [wake] search; Meck uses the gated abctogo.com flow).
-abcgo_boards = ["nh"]
+# Empty by default — the only live ABC/GO board, New Hanover ("nh" / Wilmington),
+# is ~2.5h from Hillsborough, out of practical driving range, so it's back-burnered
+# like Mecklenburg (future expansion). The adapter still works; add "nh" (or a new
+# in-range subdomain, as the platform adds "new locations daily") to re-enable.
+abcgo_boards = []
 # Terms POSTed to each board's inventory search. Leave empty to derive them at run time
 # from the live Allocation/Limited warehouse watchlist (recommended).
 search_terms = []
