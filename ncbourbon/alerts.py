@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import smtplib
 import sqlite3
+from dataclasses import replace
 from email.message import EmailMessage
 
 from .config import AlertConfig
@@ -82,16 +83,31 @@ def alert(
     log_alert(conn, kind, key, f"[{'sent' if sent else 'logged'}] {subject}")
 
 
-def send_digest(conn: sqlite3.Connection, cfg) -> None:
-    """The daily report, mailed. Same object the site and terminal render, so
-    the three cannot drift into different answers."""
-    from .report import build_report, render_text
-
-    report = build_report(conn, cfg)
+def _subject(report) -> str:
     n = len(report.shelf)
-    subject = (
+    return (
         f"NC bourbon — {n} on shelves near you"
         if n
         else "NC bourbon — nothing on shelves today"
     )
-    send_email(cfg.alerts, subject, render_text(report))
+
+
+def send_digest(conn: sqlite3.Connection, cfg) -> None:
+    """The daily report, mailed once per subscriber.
+
+    The report is built once and narrowed per person, so everyone's copy is
+    derived from the same observation. With no subscribers configured this
+    mails the whole thing to `alerts.to_addrs`, which is the single-user case
+    and the historical behaviour.
+    """
+    from .report import build_report, for_subscriber, render_text
+
+    report = build_report(conn, cfg)
+    if not cfg.subscribers:
+        send_email(cfg.alerts, _subject(report), render_text(report))
+        return
+    for sub in cfg.subscribers:
+        theirs = for_subscriber(report, sub)
+        one = replace(cfg.alerts, to_addrs=[sub.email])
+        send_email(one, _subject(theirs), render_text(theirs))
+        log.info("digest -> %s (%d products)", sub.email, len(theirs.shelf))

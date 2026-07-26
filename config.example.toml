@@ -1,6 +1,9 @@
 # nc-bourbon-finder configuration
 # Copy to config.toml and edit. SMTP password goes in the
 # NCBOURBON_SMTP_PASSWORD environment variable, never in this file.
+#
+# config.toml is COMMITTED TO THIS REPO, which is public. Nothing that belongs
+# to someone else goes in here — see the [[subscribers]] note at the bottom.
 
 [general]
 db_path = "ncbourbon.db"
@@ -51,3 +54,25 @@ search_terms = []
 durham = true
 # Greensboro (Guilford) ABC — SuiteCommerce storefront (shop.greensboroabc.com).
 greensboro = true
+
+# Daily report by email, one message per person, scoped to their boards and
+# brands. Optional — the site needs no subscription and one poll serves every
+# reader, so this is only for someone who wants it in an inbox.
+#
+# PREFER THE ENV VAR. This file is committed to a public repo, and a
+# neighbour's email address is theirs, not yours. Set NCBOURBON_SUBSCRIBERS to
+# a JSON list instead (in GitHub: a repo secret of the same name):
+#
+#   NCBOURBON_SUBSCRIBERS='[{"name":"Colin","email":"you@example.com",
+#                            "boards":["durham","greensboro","wake"],
+#                            "patterns":["Weller","Blanton"]}]'
+#
+# The env var wins over anything below. Empty `boards` means every active
+# board; empty `patterns` means everything on the watchlist. With no
+# subscribers at all, the report goes to [alerts] to_addrs as before.
+#
+# [[subscribers]]
+# name = "Example"
+# email = "someone@example.com"
+# boards = ["durham", "greensboro"]
+# patterns = ["Weller", "Blanton", "E.H. Taylor"]

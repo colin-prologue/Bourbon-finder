@@ -5,6 +5,7 @@ SMTP password comes from the NCBOURBON_SMTP_PASSWORD env var, never the file.
 """
 from __future__ import annotations
 
+import json
 import os
 import tomllib
 from dataclasses import dataclass, field
@@ -63,6 +64,43 @@ class BoardsConfig:
 
 
 @dataclass
+class Subscriber:
+    """One person who gets the daily report by email.
+
+    Neighbours mostly want the site — it needs no account and one poll serves
+    every reader. This exists only for the case an inbox cannot serve itself:
+    a mailed summary, scoped to the boards someone can actually drive to and,
+    optionally, the brands they care about.
+    """
+    name: str = ""
+    email: str = ""
+    boards: list[str] = field(default_factory=list)    # empty = every active board
+    patterns: list[str] = field(default_factory=list)  # empty = everything watched
+
+
+def load_subscribers(data: dict) -> list[Subscriber]:
+    """Subscribers come from NCBOURBON_SUBSCRIBERS (a JSON list) in preference
+    to config.toml.
+
+    This repo is public and config.toml is committed to it. A neighbour's email
+    address is theirs, not ours, so the documented path puts the list in a
+    secret and the config file is only appropriate for a private checkout.
+    """
+    raw = os.environ.get("NCBOURBON_SUBSCRIBERS", "").strip()
+    entries = json.loads(raw) if raw else data.get("subscribers", [])
+    return [
+        Subscriber(
+            name=s.get("name", ""),
+            email=s.get("email", ""),
+            boards=list(s.get("boards", [])),
+            patterns=list(s.get("patterns", [])),
+        )
+        for s in entries
+        if s.get("email")
+    ]
+
+
+@dataclass
 class Config:
     db_path: str = "ncbourbon.db"
     user_agent: str = "nc-bourbon-finder/0.1 (personal hobby tool)"
@@ -71,15 +109,18 @@ class Config:
     watch: WatchConfig = field(default_factory=WatchConfig)
     wake: WakeConfig = field(default_factory=WakeConfig)
     boards: BoardsConfig = field(default_factory=BoardsConfig)
+    subscribers: list[Subscriber] = field(default_factory=list)
 
 
 def load_config(path: str | None = None) -> Config:
     cfg_path = Path(path or os.environ.get("NCBOURBON_CONFIG", "config.toml"))
     cfg = Config()
     if not cfg_path.exists():
+        cfg.subscribers = load_subscribers({})   # the env var still applies
         return cfg
     with open(cfg_path, "rb") as f:
         data = tomllib.load(f)
+    cfg.subscribers = load_subscribers(data)
     general = data.get("general", {})
     cfg.db_path = general.get("db_path", cfg.db_path)
     cfg.user_agent = general.get("user_agent", cfg.user_agent)
