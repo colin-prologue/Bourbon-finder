@@ -100,6 +100,42 @@ moment to add a backend.
 The page carries `noindex` and says plainly that it is a personal hobby tool
 reproducing public records, not anything official.
 
+### Publishing it
+
+`poll.yml` renders and deploys to GitHub Pages after every poll. Shelf data only
+moves three times a day, but warehouse Total Available falls through the day as
+boards order, and that drawdown is the only forward-looking signal left since
+the shipment feed was retired — a page showing an eight-hour-old one while
+claiming to be the current picture would undercut the point of having a page.
+
+**One-time manual step:** repo Settings → Pages → Source → "GitHub Actions".
+There is no way to set that from a workflow.
+
+Running the workflow by hand (Actions → poll → Run workflow) refreshes on
+demand; the `loops` input picks which loops to run.
+
+### Getting it by email
+
+Optional, and only for someone who wants it in an inbox — the site needs no
+subscription and one poll serves every reader. Set the `NCBOURBON_SUBSCRIBERS`
+secret to a JSON list:
+
+```json
+[{"name": "Colin", "email": "you@example.com",
+  "boards": ["durham", "greensboro", "wake"],
+  "patterns": ["Weller", "Blanton"]}]
+```
+
+The report is built once and narrowed per person, so everyone's copy comes from
+the same observation. Empty `boards` means every active board; empty `patterns`
+means everything watched. With no subscribers configured it mails the whole
+report to `[alerts] to_addrs`, as before.
+
+Put addresses in the secret, not `config.toml` — **this repo is public and
+`config.toml` is committed to it**, and a neighbour's address is theirs. For the
+same reason nothing logs an address: Actions logs on a public repo are public,
+and GitHub masks the secret as a whole rather than the addresses inside it.
+
 ## Setup
 
 ```bash
@@ -130,10 +166,15 @@ rewrites the whole file.
 
 ### Scheduling on GitHub Actions (no server needed)
 
-Push this repo to GitHub (private is fine), add the
-`NCBOURBON_SMTP_PASSWORD` secret, and `.github/workflows/poll.yml` does the
-rest (it commits the SQLite DB back to the repo to persist state between
-runs). Actions cron is best-effort — minutes of jitter, occasionally more.
+Push this repo to GitHub, add the `NCBOURBON_SMTP_PASSWORD` secret, and
+`.github/workflows/poll.yml` does the rest (it commits the SQLite DB back to
+the repo to persist state between runs).
+
+Actions cron is best-effort — minutes of jitter, occasionally much more — so
+which loops run is decided by `github.event.schedule`, the cron expression that
+actually fired, never by reading the clock. An earlier version required the run
+to land in minutes 10–29 of specific hours; drift meant the board and catalog
+loops almost never ran while the workflow reported success every 20 minutes.
 
 Because the DB is committed on every poll, **the database's size is the
 repo's size**. History is therefore stored at the granularity it is read

@@ -380,6 +380,49 @@ def build_report(conn: sqlite3.Connection, cfg: Config, window_hours: int = 24) 
     )
 
 
+def for_subscriber(report: Report, sub) -> Report:
+    """Narrow a report to one person's boards and brands.
+
+    Filtering here rather than in the queries means everyone's copy is derived
+    from the same observation — nobody gets a subtly different answer because
+    their email was built from its own pass over the database.
+    """
+    import re
+    from dataclasses import replace
+
+    boards = set(sub.boards)
+    pattern = re.compile("|".join(sub.patterns), re.I) if sub.patterns else None
+
+    def keep_name(name: str) -> bool:
+        return pattern is None or bool(pattern.search(name or ""))
+
+    shelf = []
+    for item in report.shelf:
+        if not keep_name(item.name):
+            continue
+        stores = [s for s in item.stores if not boards or s.board in boards]
+        if stores:
+            shelf.append(replace(item, stores=stores, total=sum(s.qty for s in stores)))
+
+    changes = [
+        c for c in report.changes
+        if keep_name(c.name) and (not boards or c.board in boards)
+    ]
+    warehouse = [w for w in report.warehouse if keep_name(w.name)]
+    # Source health narrows with everything else. A Greensboro-only reader has
+    # nothing to do about a Durham scraper failing, and a warning they cannot
+    # act on is the kind of thing that teaches people to skim past the section
+    # that also carries the ones they can. The statewide loops stay for
+    # everyone: they feed every board's watchlist.
+    sources = [
+        s for s in report.sources
+        if not boards or s.source in {"stocks", "catalog"} or s.source in boards
+    ]
+    return replace(
+        report, shelf=shelf, changes=changes, warehouse=warehouse, sources=sources
+    )
+
+
 def render_json(report: Report) -> dict:
     return asdict(report)
 

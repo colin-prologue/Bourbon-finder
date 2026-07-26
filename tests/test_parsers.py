@@ -1143,6 +1143,105 @@ def test_page_never_interpolates_feed_values_into_markup():
         assert "${" not in block, f"interpolated innerHTML block:\n{block}"
 
 
+def test_subscribers_come_from_the_env_var_in_preference_to_config(monkeypatch):
+    """This repo is public and config.toml is committed to it, so the
+    documented home for other people's addresses is a secret."""
+    from ncbourbon.config import load_subscribers
+
+    in_file = {"subscribers": [{"name": "From file", "email": "file@example.com"}]}
+    monkeypatch.delenv("NCBOURBON_SUBSCRIBERS", raising=False)
+    assert [s.email for s in load_subscribers(in_file)] == ["file@example.com"]
+
+    monkeypatch.setenv(
+        "NCBOURBON_SUBSCRIBERS",
+        '[{"name":"From env","email":"env@example.com","boards":["durham"]}]',
+    )
+    subs = load_subscribers(in_file)
+    assert [s.email for s in subs] == ["env@example.com"]
+    assert subs[0].boards == ["durham"]
+
+
+def test_report_narrows_to_a_subscribers_boards_and_brands():
+    from ncbourbon.config import Config, Subscriber
+    from ncbourbon.report import build_report, for_subscriber
+
+    cfg = Config()
+    cfg.boards.abcgo_boards = ["nh"]      # both boards active for this report
+    cfg.wake.enabled = False
+    report = build_report(_report_fixture_db(), cfg)
+    assert report.shelf[0].total == 12    # 2 + 3 greensboro + 7 nh
+
+    near = for_subscriber(report, Subscriber(email="a@b.c", boards=["greensboro"]))
+    assert near.shelf[0].total == 5       # totals follow the filter, not the source
+    assert {s.board for s in near.shelf[0].stores} == {"greensboro"}
+
+    # A brand filter that matches nothing yields an empty shelf, not everything.
+    none = for_subscriber(report, Subscriber(email="a@b.c", patterns=["Pappy"]))
+    assert none.shelf == []
+
+    # Source warnings narrow too: a Greensboro-only reader can do nothing about
+    # a Durham scraper, and unactionable warnings teach people to skim the
+    # section that also carries the actionable ones.
+    from ncbourbon.db import record_health
+
+    conn = _report_fixture_db()
+    for source in ("stocks", "catalog", "durham", "greensboro"):
+        record_health(conn, source, True)
+    cfg2 = Config()
+    cfg2.boards.abcgo_boards = []
+    full = build_report(conn, cfg2)
+    theirs = for_subscriber(full, Subscriber(email="a@b.c", boards=["greensboro"]))
+    named = {s.source for s in theirs.sources}
+    assert "durham" not in named
+    assert {"stocks", "catalog"} <= named      # statewide loops feed every board
+
+
+def test_digest_mails_each_subscriber_their_own_copy(monkeypatch):
+    from ncbourbon import alerts as alerts_mod
+    from ncbourbon.config import AlertConfig, Config, Subscriber
+
+    sent = []
+    monkeypatch.setattr(
+        alerts_mod, "send_email",
+        lambda cfg, subject, body: sent.append((cfg.to_addrs, subject, body)) or True,
+    )
+    cfg = Config()
+    cfg.wake.enabled = False
+    cfg.alerts = AlertConfig(smtp_host="x", to_addrs=["owner@example.com"])
+    cfg.subscribers = [
+        Subscriber(name="Near", email="near@example.com", boards=["greensboro"]),
+        Subscriber(name="Nope", email="nope@example.com", patterns=["Pappy"]),
+    ]
+    alerts_mod.send_digest(_report_fixture_db(), cfg)
+
+    assert [to for to, _, _ in sent] == [["near@example.com"], ["nope@example.com"]]
+    assert "Blanton's" in sent[0][2]
+    assert "nothing on shelves" in sent[1][1].lower()   # their filter matched nothing
+
+
+def test_digest_never_logs_a_subscriber_address(monkeypatch, caplog):
+    """This runs in Actions on a public repo, so the log is public — and GitHub
+    masks the NCBOURBON_SUBSCRIBERS secret as a whole, not the addresses inside
+    it. Logging one would undo the reason for using a secret at all."""
+    import logging
+
+    from ncbourbon import alerts as alerts_mod
+    from ncbourbon.config import AlertConfig, Config, Subscriber
+
+    monkeypatch.setattr(alerts_mod, "send_email", lambda cfg, subject, body: True)
+    cfg = Config()
+    cfg.wake.enabled = False
+    cfg.alerts = AlertConfig(smtp_host="x", to_addrs=["owner@example.com"])
+    cfg.subscribers = [
+        Subscriber(name="Neighbour", email="secret.person@example.com", boards=["greensboro"]),
+    ]
+    with caplog.at_level(logging.DEBUG):
+        alerts_mod.send_digest(_report_fixture_db(), cfg)
+
+    assert "secret.person@example.com" not in caplog.text
+    assert "Neighbour" in caplog.text          # still identifiable for debugging
+
+
 def test_board_history_records_changes_not_rereadings(monkeypatch):
     """board_stock is history; re-polling an unchanged shelf must not append.
 
