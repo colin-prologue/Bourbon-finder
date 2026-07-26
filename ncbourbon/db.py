@@ -5,6 +5,12 @@ import sqlite3
 from datetime import datetime, timezone
 
 SCHEMA = """
+-- One row per code per report day. The warehouse report is a DAILY artifact:
+-- polling it every 20 minutes re-reads the same numbers, so keying history on
+-- fetched_at stored ~72 identical copies of every code every day (248k rows /
+-- 48MB in the first six days, all of it committed to git on each poll).
+-- fetched_at is kept as "when we last saw this day's figure", not as part of
+-- the key. Intra-day changes overwrite; nothing downstream reads them.
 CREATE TABLE IF NOT EXISTS warehouse_snapshot (
   nc_code TEXT NOT NULL,
   brand_name TEXT,
@@ -15,9 +21,9 @@ CREATE TABLE IF NOT EXISTS warehouse_snapshot (
   supplier TEXT,
   supplier_allotment TEXT,
   broker TEXT,
-  report_date TEXT,
+  report_date TEXT NOT NULL,
   fetched_at TEXT NOT NULL,
-  PRIMARY KEY (nc_code, fetched_at)
+  PRIMARY KEY (nc_code, report_date)
 );
 CREATE TABLE IF NOT EXISTS stock_latest (
   nc_code TEXT PRIMARY KEY,
@@ -48,6 +54,7 @@ CREATE TABLE IF NOT EXISTS wake_stock (
   store TEXT NOT NULL,
   qty INTEGER,
   observed_at TEXT NOT NULL,
+  prev_qty INTEGER,     -- see board_stock: history records transitions
   PRIMARY KEY (plu, store, observed_at)
 );
 CREATE TABLE IF NOT EXISTS wake_latest (
@@ -56,6 +63,7 @@ CREATE TABLE IF NOT EXISTS wake_latest (
   name TEXT,
   qty INTEGER,
   updated_at TEXT,
+  price TEXT,          -- as board_latest carries it; see _migrate()
   PRIMARY KEY (plu, store)
 );
 CREATE TABLE IF NOT EXISTS allocated_list (
@@ -83,6 +91,12 @@ CREATE TABLE IF NOT EXISTS health (
   last_error TEXT,
   consecutive_failures INTEGER DEFAULT 0
 );
+-- History rows are TRANSITIONS, not states: prev_qty is what the shelf held
+-- before this observation. Without it a reader cannot tell 0 -> 4 (a bottle
+-- arriving) from 4 -> 2 (someone buying one), and the report called both an
+-- appearance — so a single restock followed by two sales printed as "3
+-- appeared", exactly the fan-out noise this tool exists to remove.
+-- prev_qty IS NULL means "no prior observation" (a genuine first sighting).
 CREATE TABLE IF NOT EXISTS board_stock (
   board TEXT NOT NULL,
   plu TEXT NOT NULL,
@@ -91,6 +105,7 @@ CREATE TABLE IF NOT EXISTS board_stock (
   store TEXT NOT NULL,
   qty INTEGER,
   observed_at TEXT NOT NULL,
+  prev_qty INTEGER,
   PRIMARY KEY (board, plu, store, observed_at)
 );
 CREATE TABLE IF NOT EXISTS board_latest (
@@ -103,8 +118,90 @@ CREATE TABLE IF NOT EXISTS board_latest (
   updated_at TEXT,
   PRIMARY KEY (board, plu, store)
 );
-CREATE INDEX IF NOT EXISTS idx_snapshot_code ON warehouse_snapshot (nc_code, fetched_at);
+CREATE INDEX IF NOT EXISTS idx_board_stock_observed ON board_stock (observed_at);
 """
+
+# Snapshot history is keyed (nc_code, report_date), so the primary key already
+# serves cmd_history's "one code, ordered by day" lookup. The old
+# idx_snapshot_code (nc_code, fetched_at) duplicated it at 9MB and is dropped
+# by the migration below.
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """One-shot schema upgrades. Idempotent: each step no-ops once applied.
+
+    Kept here rather than in a migration framework because there is exactly
+    one database, it lives on one machine (plus the copy in CI), and a
+    version table would be more moving parts than the thing it versions.
+    """
+    # wake_latest gained `price` so a price-only change is still observable.
+    # History now records changes rather than re-readings, and quantity alone
+    # was the comparison — so a repriced bottle at an unchanged quantity wrote
+    # nothing to wake_stock and had nowhere else to land. board_latest already
+    # carried price; this makes the two paths agree.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(wake_latest)")}
+    if "price" not in cols:
+        conn.execute("ALTER TABLE wake_latest ADD COLUMN price TEXT")
+        conn.commit()
+
+    # History became transition-shaped. Existing rows keep prev_qty NULL, which
+    # reads as "no prior observation" — the honest answer for rows written
+    # before the column existed, and it keeps them out of the report's
+    # appeared/cleared counts rather than guessing a direction for them.
+    for table in ("board_stock", "wake_stock"):
+        cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if "prev_qty" not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN prev_qty INTEGER")
+            conn.commit()
+
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='warehouse_snapshot'"
+    ).fetchone()
+    if not row or "PRIMARY KEY (nc_code, fetched_at)" not in row[0]:
+        return
+
+    # Re-key warehouse_snapshot to (nc_code, report_date) and collapse the
+    # existing intra-day duplicates to the last reading of each day. SQLite
+    # guarantees the bare columns come from the row that produced MAX(), so
+    # this keeps each day's final figures rather than an arbitrary mix.
+    conn.executescript(
+        """
+        BEGIN;
+        CREATE TABLE warehouse_snapshot_new (
+          nc_code TEXT NOT NULL,
+          brand_name TEXT,
+          listing_type TEXT,
+          total_available INTEGER,
+          size TEXT,
+          cases_per_pallet TEXT,
+          supplier TEXT,
+          supplier_allotment TEXT,
+          broker TEXT,
+          report_date TEXT NOT NULL,
+          fetched_at TEXT NOT NULL,
+          PRIMARY KEY (nc_code, report_date)
+        );
+        INSERT INTO warehouse_snapshot_new
+        SELECT nc_code, brand_name, listing_type, total_available, size,
+               cases_per_pallet, supplier, supplier_allotment, broker,
+               report_date, MAX(fetched_at)
+        FROM warehouse_snapshot
+        WHERE report_date IS NOT NULL
+        GROUP BY nc_code, report_date;
+        DROP INDEX IF EXISTS idx_snapshot_code;
+        DROP TABLE warehouse_snapshot;
+        ALTER TABLE warehouse_snapshot_new RENAME TO warehouse_snapshot;
+        COMMIT;
+        """
+    )
+    # Reclaim the freed pages now. This is the one moment it clearly pays: the
+    # collapse frees ~90% of the file, and the file gets committed to git.
+    prev = conn.isolation_level
+    conn.isolation_level = None
+    try:
+        conn.execute("VACUUM")
+    finally:
+        conn.isolation_level = prev
 
 
 def now_iso() -> str:
@@ -115,7 +212,47 @@ def connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
+
+
+def prune(conn: sqlite3.Connection, snapshot_days: int, board_days: int) -> dict[str, int]:
+    """Drop history past the retention horizon, then reclaim the pages.
+
+    The database is committed to git after every poll, so its size is the
+    repo's size. Warehouse history is one row per code per day and is what
+    `history` reads; board history is finer-grained and only ever read as
+    "recently", so it keeps a shorter window.
+    """
+    cutoffs = {
+        "warehouse_snapshot": (
+            "DELETE FROM warehouse_snapshot WHERE report_date < date('now', ?)",
+            f"-{snapshot_days} days",
+        ),
+        "board_stock": (
+            "DELETE FROM board_stock WHERE observed_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)",
+            f"-{board_days} days",
+        ),
+        "wake_stock": (
+            "DELETE FROM wake_stock WHERE observed_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)",
+            f"-{board_days} days",
+        ),
+        "alert_log": (
+            "DELETE FROM alert_log WHERE sent_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)",
+            f"-{board_days} days",
+        ),
+    }
+    deleted = {}
+    for table, (sql, offset) in cutoffs.items():
+        deleted[table] = conn.execute(sql, (offset,)).rowcount
+    conn.commit()
+    prev = conn.isolation_level
+    conn.isolation_level = None
+    try:
+        conn.execute("VACUUM")
+    finally:
+        conn.isolation_level = prev
+    return deleted
 
 
 def record_health(conn: sqlite3.Connection, source: str, ok: bool, error: str = "") -> int:

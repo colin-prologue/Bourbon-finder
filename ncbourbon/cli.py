@@ -7,6 +7,7 @@
   python -m ncbourbon poll-wake       # 2-4x/day (Wake ABC store inventory)
   python -m ncbourbon digest          # daily summary email
   python -m ncbourbon status          # print health + watched items
+  python -m ncbourbon prune           # daily: trim history, reclaim DB pages
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ from . import alerts as alerts_mod
 from .alerts import alert, send_digest
 from .config import load_config
 from .db import connect, now_iso, record_health
+from .db import prune as db_prune
 from .diff import (
     apply_board_snapshot,
     apply_catalog_items,
@@ -281,8 +283,7 @@ def cmd_history(conn, code: str):
     aggregate — the state doesn't publish per-board history)."""
     rows = conn.execute(
         "SELECT report_date, listing_type, brand_name, total_available "
-        "FROM warehouse_snapshot WHERE nc_code=? GROUP BY report_date "
-        "ORDER BY report_date", (code,),
+        "FROM warehouse_snapshot WHERE nc_code=? ORDER BY report_date", (code,),
     ).fetchall()
     if not rows:
         print(f"No history for NC code {code}. Run backfill first?")
@@ -293,6 +294,25 @@ def cmd_history(conn, code: str):
         delta = "" if prev is None else f"  ({r['total_available'] - prev:+d})"
         print(f"  {r['report_date']}  {r['total_available']:>6} cases{delta}")
         prev = r["total_available"]
+
+
+def cmd_prune(conn, snapshot_days: int, board_days: int):
+    """Trim history to the retention horizon and reclaim the pages.
+
+    The DB is committed to git after every poll, so unbounded history is
+    unbounded repo growth. Run this on the daily schedule, not per poll —
+    VACUUM rewrites the whole file.
+    """
+    before = conn.execute("PRAGMA page_count").fetchone()[0] * conn.execute(
+        "PRAGMA page_size"
+    ).fetchone()[0]
+    deleted = db_prune(conn, snapshot_days, board_days)
+    after = conn.execute("PRAGMA page_count").fetchone()[0] * conn.execute(
+        "PRAGMA page_size"
+    ).fetchone()[0]
+    for table, n in deleted.items():
+        log.info("prune: %s -%d rows", table, n)
+    log.info("prune: %.1f MB -> %.1f MB", before / 1048576, after / 1048576)
 
 
 def cmd_status(conn, cfg):
@@ -314,12 +334,16 @@ def main(argv=None):
     p = argparse.ArgumentParser(prog="ncbourbon")
     p.add_argument("command", choices=[
         "poll-stocks", "poll-shipments", "poll-boards", "poll-catalog", "poll-wake", "digest", "status",
-        "backfill", "history",
+        "backfill", "history", "prune",
     ])
     p.add_argument("arg", nargs="?", default=None, help="NC code (for history)")
     p.add_argument("--config", default=None)
     p.add_argument("--days", type=int, default=90, help="backfill: how many days back")
     p.add_argument("--delay", type=float, default=4.0, help="backfill: seconds between requests")
+    p.add_argument("--snapshot-days", type=int, default=365,
+                   help="prune: keep this many days of warehouse history")
+    p.add_argument("--board-days", type=int, default=90,
+                   help="prune: keep this many days of board/wake/alert history")
     args = p.parse_args(argv)
     cfg = load_config(args.config)
     conn = connect(cfg.db_path)
@@ -334,6 +358,7 @@ def main(argv=None):
         "status": lambda: cmd_status(conn, cfg),
         "backfill": lambda: cmd_backfill(conn, cfg, session, args.days, args.delay),
         "history": lambda: cmd_history(conn, args.arg or ""),
+        "prune": lambda: cmd_prune(conn, args.snapshot_days, args.board_days),
     }[args.command]()
 
 

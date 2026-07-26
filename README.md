@@ -54,8 +54,12 @@ state of the warehouse, not 60 simultaneous drops.
 ```cron
 */20 * * * *  cd /path/to/nc-bourbon-finder && .venv/bin/python -m ncbourbon poll-stocks
 15 8,12,17 * * *  cd /path/to/nc-bourbon-finder && .venv/bin/python -m ncbourbon poll-boards && .venv/bin/python -m ncbourbon poll-wake
-5 6 * * *  cd /path/to/nc-bourbon-finder && .venv/bin/python -m ncbourbon poll-catalog && .venv/bin/python -m ncbourbon digest
+5 6 * * *  cd /path/to/nc-bourbon-finder && .venv/bin/python -m ncbourbon poll-catalog && .venv/bin/python -m ncbourbon digest && .venv/bin/python -m ncbourbon prune
 ```
+
+`prune` trims history to the retention horizon (`--snapshot-days`, default 365;
+`--board-days`, default 90) and VACUUMs. Run it daily, never per poll — it
+rewrites the whole file.
 
 ### Scheduling on GitHub Actions (no server needed)
 
@@ -63,6 +67,13 @@ Push this repo to GitHub (private is fine), add the
 `NCBOURBON_SMTP_PASSWORD` secret, and `.github/workflows/poll.yml` does the
 rest (it commits the SQLite DB back to the repo to persist state between
 runs). Actions cron is best-effort — minutes of jitter, occasionally more.
+
+Because the DB is committed on every poll, **the database's size is the
+repo's size**. History is therefore stored at the granularity it is read
+at: the warehouse report is a daily artifact, so `warehouse_snapshot` keeps
+one row per code per report day (polling it 72×/day stores the same figure
+once), and board/wake history records changes rather than re-readings. The
+daily `prune` enforces the retention horizon.
 
 ## Politeness & legality
 

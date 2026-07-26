@@ -83,6 +83,216 @@ def test_stock_diff_events(tmp_path):
     assert any(e.kind == "stock_drawdown" and e.key == "27090" for e in events2)
 
 
+def test_stock_snapshot_is_one_row_per_code_per_day(tmp_path):
+    """Polling every 20 minutes must not store 72 copies of the same daily
+    figure — that grew warehouse_snapshot to 248k rows / 48MB in six days,
+    committed to git on every poll."""
+    conn = connect(str(tmp_path / "t.db"))
+    watch = WatchConfig()
+    rows = parse_stock_report((FIXTURES / "stocks_sample.html").read_text())
+    for _ in range(5):
+        apply_stock_snapshot(conn, rows, watch, "2026-07-21")
+    n = conn.execute(
+        "SELECT COUNT(*) FROM warehouse_snapshot WHERE report_date='2026-07-21'"
+    ).fetchone()[0]
+    assert n == len(rows)
+    # A later value on the same day overwrites rather than appending.
+    for r in rows:
+        if r.nc_code == "27090":
+            r.total_available = 3
+    apply_stock_snapshot(conn, rows, watch, "2026-07-21")
+    assert conn.execute(
+        "SELECT total_available FROM warehouse_snapshot WHERE nc_code='27090'"
+    ).fetchone()[0] == 3
+    # A new report day appends a fresh generation.
+    apply_stock_snapshot(conn, rows, watch, "2026-07-22")
+    assert conn.execute("SELECT COUNT(*) FROM warehouse_snapshot").fetchone()[0] == 2 * len(rows)
+
+
+def test_migration_collapses_legacy_intraday_rows(tmp_path):
+    """An existing DB on the old (nc_code, fetched_at) key is re-keyed on
+    connect, keeping the last reading of each day."""
+    import sqlite3
+
+    path = str(tmp_path / "legacy.db")
+    raw = sqlite3.connect(path)
+    raw.executescript(
+        """
+        CREATE TABLE warehouse_snapshot (
+          nc_code TEXT NOT NULL, brand_name TEXT, listing_type TEXT,
+          total_available INTEGER, size TEXT, cases_per_pallet TEXT,
+          supplier TEXT, supplier_allotment TEXT, broker TEXT,
+          report_date TEXT, fetched_at TEXT NOT NULL,
+          PRIMARY KEY (nc_code, fetched_at)
+        );
+        CREATE INDEX idx_snapshot_code ON warehouse_snapshot (nc_code, fetched_at);
+        """
+    )
+    for hhmm, avail in (("08:00:00", 13), ("12:00:00", 9), ("18:00:00", 4)):
+        raw.execute(
+            "INSERT INTO warehouse_snapshot VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            ("27090", "Blanton's", "Allocation", avail, ".75L", "", "", "", "",
+             "2026-07-21", f"2026-07-21T{hhmm}Z"),
+        )
+    raw.execute(
+        "INSERT INTO warehouse_snapshot VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        ("27090", "Blanton's", "Allocation", 40, ".75L", "", "", "", "",
+         "2026-07-22", "2026-07-22T08:00:00Z"),
+    )
+    raw.commit()
+    raw.close()
+
+    conn = connect(path)
+    kept = conn.execute(
+        "SELECT report_date, total_available FROM warehouse_snapshot "
+        "WHERE nc_code='27090' ORDER BY report_date"
+    ).fetchall()
+    assert [(r["report_date"], r["total_available"]) for r in kept] == [
+        ("2026-07-21", 4),      # last reading of the day, not the first
+        ("2026-07-22", 40),
+    ]
+    # The redundant 9MB index is gone and the key is the new one.
+    assert not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name='idx_snapshot_code'"
+    ).fetchone()
+    # Idempotent: reconnecting does not re-run the rebuild.
+    conn.close()
+    conn2 = connect(path)
+    assert conn2.execute("SELECT COUNT(*) FROM warehouse_snapshot").fetchone()[0] == 2
+
+
+def test_wake_price_change_is_not_lost_when_quantity_holds(monkeypatch):
+    """History records changes, not re-readings — but a repriced bottle at an
+    unchanged quantity is a change, and wake_latest is the only other place the
+    price could land."""
+    from ncbourbon import diff as diff_mod
+    from ncbourbon.db import connect
+    from ncbourbon.diff import apply_wake_snapshot
+    from ncbourbon.sources.wake import WakeStoreStock
+
+    clock = iter(f"2026-07-2{d}T00:00:00Z" for d in range(1, 9))
+    monkeypatch.setattr(diff_mod, "now_iso", lambda: next(clock))
+
+    conn = connect(":memory:")
+    apply_wake_snapshot(conn, [WakeStoreStock("27090", "Blanton's", "$65.95", "s1", 2)])
+    # Same quantity, new price.
+    apply_wake_snapshot(conn, [WakeStoreStock("27090", "Blanton's", "$79.95", "s1", 2)])
+
+    assert conn.execute("SELECT price FROM wake_latest").fetchone()[0] == "$79.95"
+    assert [r[0] for r in conn.execute(
+        "SELECT price FROM wake_stock ORDER BY observed_at"
+    )] == ["$65.95", "$79.95"]
+    # An identical re-reading still writes nothing.
+    apply_wake_snapshot(conn, [WakeStoreStock("27090", "Blanton's", "$79.95", "s1", 2)])
+    assert conn.execute("SELECT COUNT(*) FROM wake_stock").fetchone()[0] == 2
+
+
+def test_history_records_the_transition_not_just_the_state(monkeypatch):
+    """A reader must be able to tell 0 -> 4 (a bottle arriving) from 4 -> 2
+    (someone buying one). Storing only the new quantity made both look like an
+    appearance, so one restock plus two sales read as three arrivals."""
+    from ncbourbon import diff as diff_mod
+    from ncbourbon.db import connect
+    from ncbourbon.diff import apply_board_snapshot
+    from ncbourbon.sources.abcgo import BoardStoreStock
+
+    clock = iter(f"2026-07-2{d}T00:00:00Z" for d in range(1, 9))
+    monkeypatch.setattr(diff_mod, "now_iso", lambda: next(clock))
+
+    conn = connect(":memory:")
+    for qty in (0, 4, 2, 1):
+        apply_board_snapshot(conn, [BoardStoreStock("greensboro", "27090", "B", "$65", "s1", qty)])
+
+    assert [
+        (r["prev_qty"], r["qty"])
+        for r in conn.execute("SELECT prev_qty, qty FROM board_stock ORDER BY observed_at")
+    ] == [
+        (None, 0),   # first ever sighting — no prior observation to compare against
+        (0, 4),      # an arrival
+        (4, 2),      # a sale
+        (2, 1),      # another sale
+    ]
+
+
+def test_wake_total_sellout_clears_the_per_store_rows(monkeypatch):
+    """Wake signals a total sellout with one __ALL__ zero row, not per-store
+    zeros. Leaving the old positive rows in place kept the bottle listed as on
+    a shelf indefinitely — a drive to a store for stock that went weeks ago."""
+    from ncbourbon import diff as diff_mod
+    from ncbourbon.db import connect
+    from ncbourbon.diff import apply_wake_snapshot
+    from ncbourbon.sources.wake import WakeStoreStock
+
+    clock = iter(f"2026-07-2{d}T00:00:00Z" for d in range(1, 9))
+    monkeypatch.setattr(diff_mod, "now_iso", lambda: next(clock))
+
+    conn = connect(":memory:")
+    apply_wake_snapshot(conn, [WakeStoreStock("27090", "B", "$65", "Cary Towne", 0)])
+    apply_wake_snapshot(conn, [WakeStoreStock("27090", "B", "$65", "Cary Towne", 3)])
+    assert conn.execute(
+        "SELECT qty FROM wake_latest WHERE store='Cary Towne'"
+    ).fetchone()[0] == 3
+
+    # Sells out everywhere: the parser emits only the __ALL__ row.
+    apply_wake_snapshot(conn, [WakeStoreStock("27090", "B", "$65", "__ALL__", 0)])
+    assert conn.execute(
+        "SELECT qty FROM wake_latest WHERE store='Cary Towne'"
+    ).fetchone()[0] == 0
+    # ...and the clearance is in history as a real transition, so it can be reported.
+    assert (3, 0) in [
+        (r["prev_qty"], r["qty"])
+        for r in conn.execute("SELECT prev_qty, qty FROM wake_stock WHERE store='Cary Towne'")
+    ]
+    # Coming back in stock still fires a restock.
+    events = apply_wake_snapshot(conn, [WakeStoreStock("27090", "B", "$65", "Cary Towne", 2)])
+    assert [e.kind for e in events] == ["wake_restock"]
+
+
+def test_prune_drops_history_past_the_horizon(tmp_path):
+    from ncbourbon.db import prune
+
+    conn = connect(str(tmp_path / "t.db"))
+    conn.executescript(
+        """
+        INSERT INTO warehouse_snapshot VALUES
+          ('27090','B','Allocation',5,'','','','','','2020-01-01','2020-01-01T00:00:00Z'),
+          ('27090','B','Allocation',6,'','','','','','2999-01-01','2999-01-01T00:00:00Z');
+        INSERT INTO board_stock VALUES ('durham','27090','B','$60','s1',3,'2020-01-01T00:00:00Z',0);
+        INSERT INTO board_stock VALUES ('durham','27090','B','$60','s1',4,'2999-01-01T00:00:00Z',3);
+        """
+    )
+    conn.commit()
+    deleted = prune(conn, snapshot_days=365, board_days=90)
+    assert deleted["warehouse_snapshot"] == 1
+    assert deleted["board_stock"] == 1
+    assert conn.execute("SELECT COUNT(*) FROM warehouse_snapshot").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM board_stock").fetchone()[0] == 1
+
+
+def test_board_history_records_changes_not_rereadings(monkeypatch):
+    """board_stock is history; re-polling an unchanged shelf must not append.
+
+    Timestamps are driven so the run does not depend on wall-clock ticks —
+    board_stock is keyed on observed_at, so same-second writes would collide
+    and hide the behaviour under test.
+    """
+    from ncbourbon import diff as diff_mod
+    from ncbourbon.db import connect
+    from ncbourbon.diff import apply_board_snapshot
+    from ncbourbon.sources.abcgo import BoardStoreStock
+
+    clock = iter(f"2026-07-2{d}T00:00:00Z" for d in range(1, 9))
+    monkeypatch.setattr(diff_mod, "now_iso", lambda: next(clock))
+
+    conn = connect(":memory:")
+    rows = [BoardStoreStock("durham", "27090", "Blanton's", "$60", "s1", 3)]
+    for _ in range(3):
+        apply_board_snapshot(conn, rows)
+    assert conn.execute("SELECT COUNT(*) FROM board_stock").fetchone()[0] == 1
+    apply_board_snapshot(conn, [BoardStoreStock("durham", "27090", "Blanton's", "$60", "s1", 1)])
+    assert conn.execute("SELECT COUNT(*) FROM board_stock").fetchone()[0] == 2
+
+
 def test_wake_diff_restock(tmp_path):
     conn = connect(str(tmp_path / "t.db"))
     rows = parse_wake_results((FIXTURES / "wake_sample.html").read_text())
