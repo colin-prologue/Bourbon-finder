@@ -1082,6 +1082,29 @@ def test_report_flags_a_stale_source():
     assert sources["catalog"].last_ok is None and sources["catalog"].stale
 
 
+def test_render_site_writes_a_self_contained_page(tmp_path):
+    """The page must work for a neighbour on a phone with no CDN reachable."""
+    import json
+
+    from ncbourbon.config import Config
+    from ncbourbon.site import render_site
+
+    cfg = Config()
+    cfg.wake.enabled = False
+    out = render_site(_report_fixture_db(), cfg, str(tmp_path / "site"))
+
+    data = json.loads((out / "data.json").read_text())
+    assert [i["nc_code"] for i in data["shelf"]] == ["27090"]
+
+    html = (out / "index.html").read_text()
+    assert (out / ".nojekyll").exists()          # Pages must not run this through Jekyll
+    assert "noindex" in html                     # a personal tool, not a public listing
+    # No external fetches: the only network call is for the sibling data file.
+    for reach in ("https://", "http://", "src="):
+        assert reach not in html, f"page reaches outside itself via {reach!r}"
+    assert "data.json" in html
+
+
 def test_board_history_records_changes_not_rereadings(monkeypatch):
     """board_stock is history; re-polling an unchanged shelf must not append.
 

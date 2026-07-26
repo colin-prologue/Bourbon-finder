@@ -78,6 +78,28 @@ different answers. It covers:
    a silently broken scraper shows up as a stale source rather than as an
    inbox that mysteriously went quiet.
 
+## The site
+
+```bash
+python -m ncbourbon render-site --out site
+```
+
+Writes `data.json` (the report, verbatim) and `index.html` (a page that reads
+it). No framework, no build step, no CDN — it is meant to keep working for
+someone on a phone in a parking lot, and every dependency is one more thing
+that can be down at that moment.
+
+**Watchlists live in the browser, not on the server.** Each person stars the
+products they care about; the selection persists in `localStorage`, and "Copy
+my list link" encodes it in the URL fragment so you can hand a neighbour a
+pre-filled list. That is the entire multi-user story: no accounts, no
+server-side user records, nothing to administer, and one poll serves every
+reader. If self-serve email subscriptions ever become the ask, *that* is the
+moment to add a backend.
+
+The page carries `noindex` and says plainly that it is a personal hobby tool
+reproducing public records, not anything official.
+
 ## Setup
 
 ```bash
