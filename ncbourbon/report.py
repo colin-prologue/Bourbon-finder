@@ -303,19 +303,28 @@ def _sources(conn: sqlite3.Connection, boards: set[str]) -> list[SourceStatus]:
     Reporting those as needing attention is crying wolf about things working
     exactly as intended — and it buries the one case that matters.
     """
-    expected = {"stocks", "catalog"} | boards | {f"abcgo:{b}" for b in boards}
+    expected = {"stocks", "catalog"} | boards
+    rows = {
+        r["source"]: r
+        for r in conn.execute("SELECT * FROM health")
+        if r["source"] in expected or r["source"].removeprefix("abcgo:") in expected
+    }
+    # Build from `expected`, not from the health table. A source that has never
+    # completed a poll has no health row at all, so iterating the table silently
+    # omitted it — on a fresh install, or whenever poll-boards returns early
+    # because the watchlist is empty, the report claimed nothing needed
+    # attention while configured loops had never run once.
     out = []
-    for r in conn.execute("SELECT * FROM health ORDER BY source"):
-        if r["source"] not in expected:
-            continue
-        limit = STALE_AFTER_HOURS.get(r["source"], STALE_AFTER_HOURS["_default"])
-        age = _hours_since(r["last_ok"])
+    for source in sorted(expected):
+        r = rows.get(source) or rows.get(f"abcgo:{source}")
+        limit = STALE_AFTER_HOURS.get(source, STALE_AFTER_HOURS["_default"])
+        age = _hours_since(r["last_ok"]) if r else None
         out.append(
             SourceStatus(
-                source=r["source"],
-                last_ok=r["last_ok"],
-                last_error=r["last_error"],
-                failures=r["consecutive_failures"] or 0,
+                source=source,
+                last_ok=r["last_ok"] if r else None,
+                last_error=r["last_error"] if r else None,
+                failures=(r["consecutive_failures"] or 0) if r else 0,
                 stale=age is None or age > limit,
             )
         )

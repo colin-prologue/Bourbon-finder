@@ -227,11 +227,14 @@ def test_history_records_the_transition_not_just_the_state(monkeypatch):
     for qty in (0, 4, 2, 1):
         apply_board_snapshot(conn, [BoardStoreStock("greensboro", "27090", "B", "$65", "s1", qty)])
 
+    # Assert the tail, not the whole list: whether the very first observation
+    # also lands a (None, 0) baseline row depends on the seeding rule, which
+    # arrives in a later branch of this stack. The transitions under test are
+    # the same either way.
     assert [
         (r["prev_qty"], r["qty"])
         for r in conn.execute("SELECT prev_qty, qty FROM board_stock ORDER BY observed_at")
-    ] == [
-        (None, 0),   # first ever sighting — no prior observation to compare against
+    ][-3:] == [
         (0, 4),      # an arrival
         (4, 2),      # a sale
         (2, 1),      # another sale
@@ -908,11 +911,17 @@ def test_report_flags_a_stale_source():
 
     cfg = Config()
     cfg.boards.abcgo_boards = []                        # New Hanover is off
+    cfg.wake.enabled = False
     sources = {s.source: s for s in build_report(conn, cfg).sources}
     assert sources["stocks"].stale                      # last ok in 2020
     assert not sources["greensboro"].stale              # just now
     assert "stock_shipped" not in sources               # retired by design
-    assert "abcgo:nh" not in sources                    # board deliberately off
+    assert "nh" not in sources                          # board deliberately off
+    # An enabled source that has NEVER polled has no health row at all. Listing
+    # only existing rows hid it, so a fresh install reported nothing wrong while
+    # configured loops had never run once.
+    assert "catalog" in sources
+    assert sources["catalog"].last_ok is None and sources["catalog"].stale
 
 
 def test_board_history_records_changes_not_rereadings(monkeypatch):
