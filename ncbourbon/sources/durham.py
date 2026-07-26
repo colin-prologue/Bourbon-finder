@@ -47,6 +47,9 @@ PRICE_RE = re.compile(r"\$\s?([\d,]+\.\d{2})")
 # Durham's own badge for the bottles this tool exists to catch. Matches
 # "Limited / Allocated", "Allocated", "Limited".
 ALLOCATED_BADGE_RE = re.compile(r"allocat|limited", re.I)
+# Durham's empty-state text. A search that legitimately matched nothing says
+# so; a blocked or broken one just has no cards. See `search_cards`.
+NO_RESULTS_MARKER = "No products found"
 # Safety ceiling on per-run detail requests. Sized ~1.2x the live
 # allocated population (127 of 295 matches, measured 2026-07-26) so it does
 # not bind in normal operation — it is a runaway guard, not a coverage
@@ -93,6 +96,14 @@ def search_cards(session, term: str, timeout: int = 60) -> list[Card]:
     """
     url = f"{BASE}/search?q={quote(term)}"
     resp = fetch(session, "GET", url, timeout=timeout)
+    # A search we could not read is not a search that found nothing. `fetch`
+    # returns non-200 bodies rather than raising, so a WAF 403 on one term
+    # parsed as zero cards: its products left the `relevant` denominator
+    # entirely, and because other terms still supplied badges the run reported
+    # `fetched == relevant` and healthy while silently skipping watched
+    # bottles. A believable empty result says so on the page.
+    if resp.status_code != 200:
+        raise RuntimeError(f"durham search {term!r}: HTTP {resp.status_code}")
     soup = BeautifulSoup(resp.text, "lxml")
     cards: dict[str, Card] = {}
     for a in soup.find_all("a", href=PRODUCT_HREF_RE):
@@ -110,6 +121,11 @@ def search_cards(session, term: str, timeout: int = 60) -> list[Card]:
     # don't model yet) is kept as an unclassified card, for the same reason.
     for m in PRODUCT_HREF_RE.finditer(resp.text):
         cards.setdefault(m.group(1), Card(code=m.group(1), category="", name=""))
+    if not cards and NO_RESULTS_MARKER not in resp.text:
+        # Zero cards AND no empty-state marker: this is not a search page.
+        # NC ABC sites serve error pages with HTTP 200, so status alone does
+        # not settle it.
+        raise RuntimeError(f"durham search {term!r}: no results and no empty-state marker")
     return list(cards.values())
 
 

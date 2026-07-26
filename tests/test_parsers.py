@@ -1706,6 +1706,48 @@ def test_durham_name_pattern_matches_off_the_search_card(monkeypatch):
     assert coverage.relevant == 1
 
 
+@pytest.mark.parametrize(
+    "text, status, label",
+    [
+        ("<html><body><h1>Access Denied</h1></body></html>", 403, "WAF block"),
+        ("<html><body><h1>Server Error</h1></body></html>", 200, "HTTP-200 error page"),
+        # A non-200 is never a search result, whatever the body happens to
+        # contain — a WAF or CDN can serve a cached page that carries the
+        # empty-state text. Status is checked on its own account, not as a
+        # shortcut to the marker check.
+        ('<div><h3>No products found</h3></div>', 403, "403 carrying the empty-state text"),
+    ],
+)
+def test_durham_will_not_read_a_blocked_search_as_no_results(monkeypatch, text, status, label):
+    """A search we could not read is not a search that found nothing. A blocked
+    term used to parse as zero cards, so its products left the `relevant`
+    denominator entirely — and because other terms still supplied badges, the
+    run reported full coverage and healthy status while skipping watched
+    bottles. Silently narrowing the denominator is worse than failing."""
+    from ncbourbon.sources import durham
+
+    _durham_harness(monkeypatch, text, status=status)
+    monkeypatch.setattr(
+        durham, "fetch",
+        lambda s, m, url, **kw: type("R", (), {"text": text, "status_code": status})(),
+    )
+    with pytest.raises(RuntimeError, match="durham search"):
+        durham.fetch_durham_stock(object(), ["weller"])
+
+
+def test_durham_believes_an_empty_search_that_says_it_is_empty(monkeypatch):
+    """The other half: Durham genuinely carries nothing for many watchlist
+    terms, and those runs must not fail. An empty result is believable when the
+    page carries the empty-state marker."""
+    from ncbourbon.sources import durham
+
+    empty = '<div class="text-center py-12"><h3>No products found</h3></div>'
+    requested = _durham_harness(monkeypatch, empty)
+    rows, coverage = durham.fetch_durham_stock(object(), ["nothing here"])
+    assert rows == [] and requested == []
+    assert coverage.matched == 0 and coverage.relevant == 0
+
+
 def test_durham_fails_open_when_only_the_name_markup_changes(monkeypatch):
     """The quiet half of the same failure. If Durham reskins the <h3> but keeps
     the badge, a pattern-only bottle in an ordinary category misses the regex,
