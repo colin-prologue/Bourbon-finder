@@ -1816,6 +1816,79 @@ def test_a_board_that_knows_its_coverage_reports_it_per_code():
     assert [e.key for e in events] == ["durham:333"]
 
 
+def test_newly_covered_ground_is_silent_on_every_surface(monkeypatch):
+    """Suppressing the alert is not enough. History rows carry `prev_qty`, and a
+    NULL prev on a positive row classifies as a crossing up from zero — so a
+    newly-covered bottle stayed out of the email while the digest and the site
+    still announced it as having appeared. A quieter surface disagreeing with a
+    louder one is not a fix, it is a second answer to the same question."""
+    from datetime import datetime, timedelta, timezone
+
+    from ncbourbon.db import connect
+    from ncbourbon import diff as diff_mod
+    from ncbourbon.diff import apply_board_snapshot
+    from ncbourbon.report import _changes
+
+    # board_stock is keyed on observed_at, so several polls inside one second
+    # collide on INSERT OR IGNORE and the later rows vanish. Real polls are
+    # hours apart; step the clock so the test measures the code, not the clock.
+    clock = iter(
+        (datetime.now(timezone.utc) - timedelta(hours=h)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for h in (6, 5, 4, 3, 2, 1)
+    )
+    monkeypatch.setattr(diff_mod, "now_iso", lambda: next(clock))
+
+    conn = connect(":memory:")
+    fp = "terms-unchanged"
+    apply_board_snapshot(conn, _board_rows(("111", "Weller", "s1", 2), board="durham"),
+                         complete={"durham"}, coverage=fp, covered={"durham": {"111"}})
+
+    # 222 is promoted into the fetch set and is already on a shelf.
+    events = apply_board_snapshot(
+        conn, _board_rows(("111", "Weller", "s1", 2), ("222", "Sazerac Rye", "s1", 9),
+                          board="durham"),
+        complete={"durham"}, coverage=fp, covered={"durham": {"111", "222"}},
+    )
+    assert events == []                                   # no alert...
+    changes = _changes(conn, {"111", "222"}, {"durham"}, 24)
+    assert [c.nc_code for c in changes if c.kind == "on_shelf"] == [], (
+        "...and no 'appeared' in the report either"
+    )
+    assert conn.execute(                                  # still collected
+        "SELECT qty FROM board_latest WHERE plu='222'").fetchone()[0] == 9
+
+    # It sells out — Durham reports the store at 0 rather than dropping it.
+    apply_board_snapshot(
+        conn, _board_rows(("111", "Weller", "s1", 2), ("222", "Sazerac Rye", "s1", 0),
+                          board="durham"),
+        complete={"durham"}, coverage=fp, covered={"durham": {"111", "222", "333"}},
+    )
+    events = apply_board_snapshot(
+        conn, _board_rows(("111", "Weller", "s1", 2), ("222", "Sazerac Rye", "s1", 4),
+                          board="durham"),
+        complete={"durham"}, coverage=fp, covered={"durham": {"111", "222", "333"}},
+    )
+    assert [e.key for e in events] == ["durham:222"]
+    changes = _changes(conn, {"111", "222"}, {"durham"}, 24)
+    assert "222" in [c.nc_code for c in changes if c.kind == "on_shelf"]
+
+    # The mirror case, and the one that makes this a fix rather than a mute:
+    # 333 was covered last run and genuinely absent — so it has NO prior row at
+    # all, and its arrival is a first sighting. Suppressing history for every
+    # first sighting would keep this out of the report while still emailing it,
+    # which is the same disagreement pointing the other way.
+    events = apply_board_snapshot(
+        conn, _board_rows(("111", "Weller", "s1", 2), ("333", "Blanton's", "s1", 1),
+                          board="durham"),
+        complete={"durham"}, coverage=fp, covered={"durham": {"111", "222", "333"}},
+    )
+    assert [e.key for e in events] == ["durham:333"]
+    changes = _changes(conn, {"111", "222", "333"}, {"durham"}, 24)
+    assert "333" in [c.nc_code for c in changes if c.kind == "on_shelf"], (
+        "a covered code's first sighting is a real arrival and belongs in the report"
+    )
+
+
 def test_term_driven_boards_keep_the_fingerprint():
     """The per-code ledger must NOT be applied to boards whose coverage is a
     query rather than a list. ABC/GO and Greensboro return only in-stock
