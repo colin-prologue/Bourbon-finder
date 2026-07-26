@@ -1,0 +1,29 @@
+# Gates pull requests on the test suite. GitHub runs this against the PR's
+# merge ref (the branch merged into the base), so a broken *merge result* is
+# caught even when each branch passed in isolation. pull_request only — the
+# scheduled poll.yml commits ncbourbon.db straight to main and never touches
+# code, so there's nothing to test on those pushes.
+name: tests
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"   # the floor the code targets (stdlib tomllib)
+      - name: Install deps
+        run: pip install -r requirements.txt pytest
+      - name: Run tests
+        run: python -m pytest tests/ -q
