@@ -158,6 +158,26 @@ def apply_wake_snapshot(conn: sqlite3.Connection, rows: list[WakeStoreStock]) ->
         (r["plu"], r["store"]): (r["qty"], r["price"])
         for r in conn.execute("SELECT plu, store, qty, price FROM wake_latest").fetchall()
     }
+    # Wake signals "sold out everywhere" with a single __ALL__ zero row rather
+    # than per-store zeros, so the previous positive per-store rows must be
+    # cleared explicitly. Without this they sit in wake_latest forever and the
+    # report keeps listing the bottle under ON A SHELF NOW — sending someone to
+    # a store for stock that went weeks ago.
+    for r in rows:
+        if r.store == "__ALL__" and r.qty == 0:
+            for (plu, store), (qty, _price) in prev.items():
+                if plu != r.plu or store == "__ALL__" or not qty:
+                    continue
+                conn.execute(
+                    "INSERT OR IGNORE INTO wake_stock "
+                    "(plu, name, price, store, qty, observed_at, prev_qty) VALUES (?,?,?,?,0,?,?)",
+                    (plu, r.name, r.price, store, ts, qty),
+                )
+                conn.execute(
+                    "UPDATE wake_latest SET qty=0, updated_at=? WHERE plu=? AND store=?",
+                    (ts, plu, store),
+                )
+                prev[(plu, store)] = (0, _price)
     for r in rows:
         old_qty, old_price = prev.get((r.plu, r.store), (None, None))
         old = old_qty
@@ -166,8 +186,9 @@ def apply_wake_snapshot(conn: sqlite3.Connection, rows: list[WakeStoreStock]) ->
         # is still a change, and dropping it would lose the new price entirely.
         if (old_qty, old_price) != (r.qty, r.price):
             conn.execute(
-                "INSERT OR IGNORE INTO wake_stock (plu, name, price, store, qty, observed_at) VALUES (?,?,?,?,?,?)",
-                (r.plu, r.name, r.price, r.store, r.qty, ts),
+                "INSERT OR IGNORE INTO wake_stock (plu, name, price, store, qty, observed_at, prev_qty) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (r.plu, r.name, r.price, r.store, r.qty, ts, old_qty),
             )
         if r.store != "__ALL__" and r.qty > 0 and (old is None or old == 0):
             events.append(
@@ -219,9 +240,10 @@ def apply_board_snapshot(
         old = prev.get((r.board, r.plu, r.store))
         if old != r.qty:  # history records changes, not re-readings of the same number
             conn.execute(
-                "INSERT OR IGNORE INTO board_stock (board, plu, name, price, store, qty, observed_at) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (r.board, r.plu, r.name, r.price, r.store, r.qty, ts),
+                "INSERT OR IGNORE INTO board_stock "
+                "(board, plu, name, price, store, qty, observed_at, prev_qty) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (r.board, r.plu, r.name, r.price, r.store, r.qty, ts, old),
             )
         if r.qty > 0 and (old is None or old == 0):
             price = f", {r.price}" if r.price else ""

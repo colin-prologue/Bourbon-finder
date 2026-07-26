@@ -184,6 +184,67 @@ def test_wake_price_change_is_not_lost_when_quantity_holds(monkeypatch):
     assert conn.execute("SELECT COUNT(*) FROM wake_stock").fetchone()[0] == 2
 
 
+def test_history_records_the_transition_not_just_the_state(monkeypatch):
+    """A reader must be able to tell 0 -> 4 (a bottle arriving) from 4 -> 2
+    (someone buying one). Storing only the new quantity made both look like an
+    appearance, so one restock plus two sales read as three arrivals."""
+    from ncbourbon import diff as diff_mod
+    from ncbourbon.db import connect
+    from ncbourbon.diff import apply_board_snapshot
+    from ncbourbon.sources.abcgo import BoardStoreStock
+
+    clock = iter(f"2026-07-2{d}T00:00:00Z" for d in range(1, 9))
+    monkeypatch.setattr(diff_mod, "now_iso", lambda: next(clock))
+
+    conn = connect(":memory:")
+    for qty in (0, 4, 2, 1):
+        apply_board_snapshot(conn, [BoardStoreStock("greensboro", "27090", "B", "$65", "s1", qty)])
+
+    assert [
+        (r["prev_qty"], r["qty"])
+        for r in conn.execute("SELECT prev_qty, qty FROM board_stock ORDER BY observed_at")
+    ] == [
+        (None, 0),   # first ever sighting — no prior observation to compare against
+        (0, 4),      # an arrival
+        (4, 2),      # a sale
+        (2, 1),      # another sale
+    ]
+
+
+def test_wake_total_sellout_clears_the_per_store_rows(monkeypatch):
+    """Wake signals a total sellout with one __ALL__ zero row, not per-store
+    zeros. Leaving the old positive rows in place kept the bottle listed as on
+    a shelf indefinitely — a drive to a store for stock that went weeks ago."""
+    from ncbourbon import diff as diff_mod
+    from ncbourbon.db import connect
+    from ncbourbon.diff import apply_wake_snapshot
+    from ncbourbon.sources.wake import WakeStoreStock
+
+    clock = iter(f"2026-07-2{d}T00:00:00Z" for d in range(1, 9))
+    monkeypatch.setattr(diff_mod, "now_iso", lambda: next(clock))
+
+    conn = connect(":memory:")
+    apply_wake_snapshot(conn, [WakeStoreStock("27090", "B", "$65", "Cary Towne", 0)])
+    apply_wake_snapshot(conn, [WakeStoreStock("27090", "B", "$65", "Cary Towne", 3)])
+    assert conn.execute(
+        "SELECT qty FROM wake_latest WHERE store='Cary Towne'"
+    ).fetchone()[0] == 3
+
+    # Sells out everywhere: the parser emits only the __ALL__ row.
+    apply_wake_snapshot(conn, [WakeStoreStock("27090", "B", "$65", "__ALL__", 0)])
+    assert conn.execute(
+        "SELECT qty FROM wake_latest WHERE store='Cary Towne'"
+    ).fetchone()[0] == 0
+    # ...and the clearance is in history as a real transition, so it can be reported.
+    assert (3, 0) in [
+        (r["prev_qty"], r["qty"])
+        for r in conn.execute("SELECT prev_qty, qty FROM wake_stock WHERE store='Cary Towne'")
+    ]
+    # Coming back in stock still fires a restock.
+    events = apply_wake_snapshot(conn, [WakeStoreStock("27090", "B", "$65", "Cary Towne", 2)])
+    assert [e.kind for e in events] == ["wake_restock"]
+
+
 def test_prune_drops_history_past_the_horizon(tmp_path):
     from ncbourbon.db import prune
 
@@ -193,8 +254,8 @@ def test_prune_drops_history_past_the_horizon(tmp_path):
         INSERT INTO warehouse_snapshot VALUES
           ('27090','B','Allocation',5,'','','','','','2020-01-01','2020-01-01T00:00:00Z'),
           ('27090','B','Allocation',6,'','','','','','2999-01-01','2999-01-01T00:00:00Z');
-        INSERT INTO board_stock VALUES ('durham','27090','B','$60','s1',3,'2020-01-01T00:00:00Z');
-        INSERT INTO board_stock VALUES ('durham','27090','B','$60','s1',4,'2999-01-01T00:00:00Z');
+        INSERT INTO board_stock VALUES ('durham','27090','B','$60','s1',3,'2020-01-01T00:00:00Z',0);
+        INSERT INTO board_stock VALUES ('durham','27090','B','$60','s1',4,'2999-01-01T00:00:00Z',3);
         """
     )
     conn.commit()

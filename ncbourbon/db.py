@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS wake_stock (
   store TEXT NOT NULL,
   qty INTEGER,
   observed_at TEXT NOT NULL,
+  prev_qty INTEGER,     -- see board_stock: history records transitions
   PRIMARY KEY (plu, store, observed_at)
 );
 CREATE TABLE IF NOT EXISTS wake_latest (
@@ -90,6 +91,12 @@ CREATE TABLE IF NOT EXISTS health (
   last_error TEXT,
   consecutive_failures INTEGER DEFAULT 0
 );
+-- History rows are TRANSITIONS, not states: prev_qty is what the shelf held
+-- before this observation. Without it a reader cannot tell 0 -> 4 (a bottle
+-- arriving) from 4 -> 2 (someone buying one), and the report called both an
+-- appearance — so a single restock followed by two sales printed as "3
+-- appeared", exactly the fan-out noise this tool exists to remove.
+-- prev_qty IS NULL means "no prior observation" (a genuine first sighting).
 CREATE TABLE IF NOT EXISTS board_stock (
   board TEXT NOT NULL,
   plu TEXT NOT NULL,
@@ -98,6 +105,7 @@ CREATE TABLE IF NOT EXISTS board_stock (
   store TEXT NOT NULL,
   qty INTEGER,
   observed_at TEXT NOT NULL,
+  prev_qty INTEGER,
   PRIMARY KEY (board, plu, store, observed_at)
 );
 CREATE TABLE IF NOT EXISTS board_latest (
@@ -135,6 +143,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if "price" not in cols:
         conn.execute("ALTER TABLE wake_latest ADD COLUMN price TEXT")
         conn.commit()
+
+    # History became transition-shaped. Existing rows keep prev_qty NULL, which
+    # reads as "no prior observation" — the honest answer for rows written
+    # before the column existed, and it keeps them out of the report's
+    # appeared/cleared counts rather than guessing a direction for them.
+    for table in ("board_stock", "wake_stock"):
+        cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if "prev_qty" not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN prev_qty INTEGER")
+            conn.commit()
 
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='warehouse_snapshot'"
