@@ -1706,6 +1706,33 @@ def test_durham_name_pattern_matches_off_the_search_card(monkeypatch):
     assert coverage.relevant == 1
 
 
+def test_durham_fails_open_when_only_the_name_markup_changes(monkeypatch):
+    """The quiet half of the same failure. If Durham reskins the <h3> but keeps
+    the badge, a pattern-only bottle in an ordinary category misses the regex,
+    falls to tier 3 and is never fetched — restoring the closed circle `_tier`
+    exists to break — while classification still looks healthy, so no coverage
+    signal fires. A name we cannot read is a question we cannot answer, not a
+    no."""
+    from ncbourbon.sources import durham
+
+    # Badge parses, name does not.
+    html = """<div>
+      <a href="/products/555?q=x" class="card"><span>Bourbon</span></a>
+      <a href="/products/666?q=x" class="card"><span>Vodka</span></a>
+    </div>"""
+    requested = _durham_harness(monkeypatch, html)
+    _rows, coverage = durham.fetch_durham_stock(object(), ["x"], name_patterns=["pappy"])
+    assert sorted(requested) == ["555", "666"], "unreadable names must be fetched, not dropped"
+    assert coverage.classified                  # badges were fine — this is the point
+
+    # With no patterns configured there is no question to answer, so ordinary
+    # categories stay tier 3 and cost nothing.
+    requested = _durham_harness(monkeypatch, html)
+    _rows, coverage = durham.fetch_durham_stock(object(), ["x"])
+    assert requested == []
+    assert coverage.relevant == 0
+
+
 def test_durham_fails_open_when_the_badge_markup_changes(monkeypatch):
     """A classifier that fails closed turns a reskin into silent data loss.
     Unclassifiable cards get fetched anyway, and the run says it was blind."""

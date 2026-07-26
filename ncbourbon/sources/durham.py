@@ -121,13 +121,23 @@ def _tier(card: Card, priority_codes, name_patterns) -> int:
     resolves patterns against names already in `board_latest` — a bottle we
     never fetch never gets a name stored, so a pattern-only watch could never
     match it. Reading the name off the card breaks that circle for free.
+
+    Both reads fail open, and they fail open independently. An unparseable
+    badge is the obvious case. The quieter one is an unparseable *name* while
+    the badge still works: a pattern-only bottle in an ordinary category would
+    miss the regex, fall to tier 3, and never be fetched — restoring exactly
+    the circle above — while classification still looked healthy, so nothing
+    would say coverage had a hole in it. A name we cannot read is a question we
+    cannot answer, not a no.
     """
     if card.code in priority_codes:
         return 1
     if card.name and any(re.search(p, card.name, re.I) for p in name_patterns):
         return 1
     if not card.category:
-        return 2                                    # unclassifiable: fail open
+        return 2                                    # unreadable badge: fail open
+    if not card.name and name_patterns:
+        return 2                                    # unreadable name: fail open
     if ALLOCATED_BADGE_RE.search(card.category):
         return 2
     return 3
