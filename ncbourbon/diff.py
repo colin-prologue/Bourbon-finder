@@ -96,6 +96,30 @@ def alertable_codes(conn: sqlite3.Connection, watch: WatchConfig, rows) -> set[s
     return codes
 
 
+def pattern_matched_codes(conn: sqlite3.Connection, watch: WatchConfig) -> set[str]:
+    """Codes already stored whose product name matches a configured pattern.
+
+    `alertable_codes` resolves patterns against the rows of a single poll, which
+    is all an applier needs. Anything reading the *stored* state — the report,
+    the site — has no such rows and must resolve patterns against the names
+    already in the database, or a pattern-only product becomes alertable but
+    invisible and the two surfaces disagree about what is being watched.
+    """
+    if not watch.name_patterns:
+        return set()
+    codes: set[str] = set()
+    for table, code_col, name_col in (
+        ("board_latest", "plu", "name"),
+        ("wake_latest", "plu", "name"),
+        ("stock_latest", "nc_code", "brand_name"),
+        ("catalog", "nc_code", "brand_name"),
+    ):
+        for r in conn.execute(f"SELECT DISTINCT {code_col} AS c, {name_col} AS n FROM {table}"):
+            if name_watched(r["n"], watch):
+                codes.add(r["c"])
+    return codes
+
+
 def apply_stock_snapshot(
     conn: sqlite3.Connection, rows: list[StockRow], watch: WatchConfig, report_date: str
 ) -> list[Event]:
@@ -275,7 +299,9 @@ def apply_wake_snapshot(
         # History records changes, not re-readings of the same numbers. Price is
         # part of "the same numbers": a repriced bottle at an unchanged quantity
         # is still a change, and dropping it would lose the new price entirely.
-        if (old_qty, old_price) != (r.qty, r.price):
+        # While seeding there is no change to record — every row would look like
+        # an arrival, which is the thing the report must not announce.
+        if (old_qty, old_price) != (r.qty, r.price) and not seeding:
             conn.execute(
                 "INSERT OR IGNORE INTO wake_stock (plu, name, price, store, qty, observed_at, prev_qty) "
                 "VALUES (?,?,?,?,?,?,?)",
@@ -386,7 +412,12 @@ def apply_board_snapshot(
     restocked: dict[tuple[str, str], list[BoardStoreStock]] = {}
     for r in rows:
         old = prev.get((r.board, r.plu, r.store))
-        if old != r.qty:  # history records changes, not re-readings of the same number
+        # History records changes, not re-readings of the same number — and a
+        # board being seeded has no changes at all. Writing its opening
+        # inventory here would make every row a transition, which is how the
+        # report would announce a newly added board's whole catalogue as having
+        # just appeared. board_latest already holds the baseline.
+        if old != r.qty and r.board in seeded:
             conn.execute(
                 "INSERT OR IGNORE INTO board_stock "
                 "(board, plu, name, price, store, qty, observed_at, prev_qty) "
@@ -422,6 +453,20 @@ def apply_board_snapshot(
                     "UPDATE board_latest SET qty=0, updated_at=? "
                     "WHERE board=? AND plu=? AND store=?",
                     (ts, board, plu, store),
+                )
+                # Record the transition in history too. This is the only path by
+                # which an ABC/GO board clears a shelf — its API hides sold-out
+                # items rather than reporting a zero row — so without this the
+                # report can never show those items as gone.
+                meta = conn.execute(
+                    "SELECT name, price FROM board_latest WHERE board=? AND plu=? AND store=?",
+                    (board, plu, store),
+                ).fetchone()
+                conn.execute(
+                    "INSERT OR IGNORE INTO board_stock (board, plu, name, price, store, qty, observed_at) "
+                    "VALUES (?,?,?,?,?,0,?)",
+                    (board, plu, meta["name"] if meta else "", meta["price"] if meta else "",
+                     store, ts),
                 )
     for (board, plu), hits in sorted(restocked.items()):
         if alertable is not None and plu not in alertable:

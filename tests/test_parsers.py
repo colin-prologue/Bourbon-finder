@@ -196,7 +196,9 @@ def test_wake_price_change_is_not_lost_when_quantity_holds(monkeypatch):
     monkeypatch.setattr(diff_mod, "now_iso", lambda: next(clock))
 
     conn = connect(":memory:")
-    apply_wake_snapshot(conn, [WakeStoreStock("27090", "Blanton's", "$65.95", "s1", 2)])
+    first = [WakeStoreStock("27090", "Blanton's", "$65.95", "s1", 2)]
+    apply_wake_snapshot(conn, zeroed(first))    # baseline; see zeroed()
+    apply_wake_snapshot(conn, first)
     # Same quantity, new price.
     apply_wake_snapshot(conn, [WakeStoreStock("27090", "Blanton's", "$79.95", "s1", 2)])
 
@@ -774,6 +776,119 @@ def test_report_renders_to_text_and_json():
     json.dumps(data)                                    # must be serialisable as-is
 
 
+def test_report_includes_products_watched_only_by_name_pattern():
+    """name_patterns exists so a Pappy bottle the state files as 'Listed' still
+    counts. If the report resolves its universe from listing type alone, such a
+    product is alertable but invisible and the two surfaces disagree."""
+    from ncbourbon.config import Config
+    from ncbourbon.db import connect
+    from ncbourbon.diff import apply_board_snapshot
+    from ncbourbon.report import build_report
+    from ncbourbon.sources.abcgo import BoardStoreStock
+
+    conn = connect(":memory:")
+    rows = [
+        BoardStoreStock("greensboro", "99999", "Pappy Van Winkle 23", "$300", "s1", 1),
+        BoardStoreStock("greensboro", "17306", "Crystal Head Vodka", "$50", "s1", 4),
+    ]
+    apply_board_snapshot(conn, zeroed(rows))
+    apply_board_snapshot(conn, rows)
+
+    cfg = Config()
+    cfg.wake.enabled = False
+    cfg.watch.name_patterns = ["Pappy"]
+    report = build_report(conn, cfg)
+    assert [i.nc_code for i in report.shelf] == ["99999"]
+    assert [c.nc_code for c in report.changes] == ["99999"]
+
+
+def test_report_includes_wake_movements():
+    """Wake is default-on and appears in `shelf`, but its history lives in its
+    own table — reading only board_stock dropped every Wake movement."""
+    from ncbourbon.config import Config
+    from ncbourbon.db import connect
+    from ncbourbon.diff import apply_wake_snapshot
+    from ncbourbon.report import build_report
+    from ncbourbon.sources.wake import WakeStoreStock
+
+    conn = connect(":memory:")
+    conn.execute("INSERT INTO allocated_list VALUES ('27090','Blantons','','L')")
+    conn.commit()
+    rows = [WakeStoreStock("27090", "Blanton's", "$65", "Cary Towne Blvd", 2)]
+    apply_wake_snapshot(conn, zeroed(rows))
+    apply_wake_snapshot(conn, rows)
+
+    report = build_report(conn, Config())
+    assert [(c.board, c.nc_code, c.kind) for c in report.changes] == [
+        ("wake", "27090", "on_shelf")
+    ]
+
+
+def test_seeding_a_board_produces_no_changes():
+    """Adding a board must not report its whole opening inventory as having
+    just appeared — the same rule that keeps it out of the inbox."""
+    from ncbourbon.config import Config
+    from ncbourbon.db import connect
+    from ncbourbon.diff import apply_board_snapshot
+    from ncbourbon.report import build_report
+    from ncbourbon.sources.abcgo import BoardStoreStock
+
+    conn = connect(":memory:")
+    conn.execute("INSERT INTO allocated_list VALUES ('27090','Blantons','','L')")
+    conn.commit()
+    rows = [
+        BoardStoreStock("greensboro", "27090", "Blanton's", "$65", f"s{i}", 3)
+        for i in range(8)
+    ]
+    apply_board_snapshot(conn, rows)          # first sight of this board
+
+    cfg = Config()
+    cfg.wake.enabled = False
+    report = build_report(conn, cfg)
+    assert report.changes == []               # nothing "appeared"
+    assert len(report.shelf[0].stores) == 8   # ...but the inventory is there
+
+
+def test_abcgo_implicit_sellout_shows_as_a_change(monkeypatch):
+    """ABC/GO hides sold-out items rather than reporting a zero row, so the
+    recheck path is the only place that clear can be recorded.
+
+    The clock is driven because board_stock is keyed on observed_at: three
+    polls inside one second would collide and hide the row under test.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from ncbourbon import diff as diff_mod
+    from ncbourbon.config import Config
+    from ncbourbon.db import connect
+    from ncbourbon.diff import apply_board_snapshot
+    from ncbourbon.report import build_report
+    from ncbourbon.sources.abcgo import BoardStoreStock
+
+    # Recent, so the changes window still covers them.
+    base = datetime.now(timezone.utc) - timedelta(hours=3)
+    clock = iter(
+        (base + timedelta(minutes=m)).strftime("%Y-%m-%dT%H:%M:%SZ") for m in range(0, 60, 10)
+    )
+    monkeypatch.setattr(diff_mod, "now_iso", lambda: next(clock))
+
+    conn = connect(":memory:")
+    conn.execute("INSERT INTO allocated_list VALUES ('27090','Blantons','','L')")
+    conn.commit()
+    rows = [BoardStoreStock("nh", "27090", "Blanton's", "$65", "s1", 4)]
+    apply_board_snapshot(conn, zeroed(rows))
+    apply_board_snapshot(conn, rows)
+    # Next poll: the code was authoritatively re-checked and the store vanished.
+    apply_board_snapshot(conn, [], observed={("nh", "27090")})
+
+    cfg = Config()
+    cfg.boards.abcgo_boards = ["nh"]
+    cfg.wake.enabled = False
+    report = build_report(conn, cfg)
+    assert report.shelf == []                                  # off every shelf
+    assert [c.kind for c in report.changes] == ["off_shelf", "on_shelf"]
+
+
 def test_report_flags_a_stale_source():
     from ncbourbon.config import Config
     from ncbourbon.db import record_health
@@ -785,9 +900,19 @@ def test_report_flags_a_stale_source():
     record_health(conn, "greensboro", True)
     conn.commit()
 
-    sources = {s.source: s for s in build_report(conn, Config()).sources}
+    # A retired probe and a disabled board are not "needing attention" — health
+    # keeps a row for every source ever polled.
+    record_health(conn, "stock_shipped", False, "retired by the state")
+    record_health(conn, "abcgo:nh", True)
+    conn.commit()
+
+    cfg = Config()
+    cfg.boards.abcgo_boards = []                        # New Hanover is off
+    sources = {s.source: s for s in build_report(conn, cfg).sources}
     assert sources["stocks"].stale                      # last ok in 2020
     assert not sources["greensboro"].stale              # just now
+    assert "stock_shipped" not in sources               # retired by design
+    assert "abcgo:nh" not in sources                    # board deliberately off
 
 
 def test_board_history_records_changes_not_rereadings(monkeypatch):
@@ -807,6 +932,7 @@ def test_board_history_records_changes_not_rereadings(monkeypatch):
 
     conn = connect(":memory:")
     rows = [BoardStoreStock("durham", "27090", "Blanton's", "$60", "s1", 3)]
+    apply_board_snapshot(conn, zeroed(rows))    # baseline; see zeroed()
     for _ in range(3):
         apply_board_snapshot(conn, rows)
     assert conn.execute("SELECT COUNT(*) FROM board_stock").fetchone()[0] == 1

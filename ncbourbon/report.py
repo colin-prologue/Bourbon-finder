@@ -23,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 
 from .config import Config
 from .db import now_iso
-from .diff import watch_codes
+from .diff import pattern_matched_codes, watch_codes
 
 # How old a source's last success may be before the report calls it stale.
 # These are generous multiples of each loop's cadence — the point is to catch a
@@ -269,12 +269,45 @@ def _changes(conn: sqlite3.Connection, codes: set[str], boards: set[str], hours:
                 at=r["observed_at"],
             )
         )
-    return out
+    # Wake is the default-on legacy path and appears in `shelf`, but its history
+    # lives in its own table — reading only board_stock silently dropped every
+    # Wake movement from the report.
+    if "wake" in boards:
+        for r in conn.execute(
+            "SELECT plu, name, store, qty, observed_at FROM wake_stock "
+            "WHERE observed_at > ? AND store != '__ALL__' ORDER BY observed_at DESC",
+            (since,),
+        ):
+            if r["plu"] not in codes:
+                continue
+            out.append(
+                Change(
+                    kind="on_shelf" if (r["qty"] or 0) > 0 else "off_shelf",
+                    nc_code=r["plu"],
+                    name=r["name"] or r["plu"],
+                    board="wake",
+                    label=r["store"],
+                    qty=r["qty"] or 0,
+                    at=r["observed_at"],
+                )
+            )
+    return sorted(out, key=lambda c: c.at, reverse=True)
 
 
-def _sources(conn: sqlite3.Connection) -> list[SourceStatus]:
+def _sources(conn: sqlite3.Connection, boards: set[str]) -> list[SourceStatus]:
+    """Freshness for the loops that are supposed to be running.
+
+    `health` accumulates a row for every source ever polled. That includes
+    boards since turned off, and `stock_shipped`, which the state retired and
+    which `poll-shipments` therefore records as failing on every run by design.
+    Reporting those as needing attention is crying wolf about things working
+    exactly as intended — and it buries the one case that matters.
+    """
+    expected = {"stocks", "catalog"} | boards | {f"abcgo:{b}" for b in boards}
     out = []
     for r in conn.execute("SELECT * FROM health ORDER BY source"):
+        if r["source"] not in expected:
+            continue
         limit = STALE_AFTER_HOURS.get(r["source"], STALE_AFTER_HOURS["_default"])
         age = _hours_since(r["last_ok"])
         out.append(
@@ -290,7 +323,10 @@ def _sources(conn: sqlite3.Connection) -> list[SourceStatus]:
 
 
 def build_report(conn: sqlite3.Connection, cfg: Config, window_hours: int = 24) -> Report:
-    codes = watch_codes(conn, cfg.watch)
+    # Patterns resolve against stored product names, not against a poll's rows —
+    # otherwise a product watched only by name_patterns is alertable but absent
+    # from every surface that reads the database.
+    codes = watch_codes(conn, cfg.watch) | pattern_matched_codes(conn, cfg.watch)
     boards = active_boards(cfg)
     suppressed = conn.execute(
         "SELECT COUNT(*) FROM alert_log WHERE kind LIKE 'capped:%' AND sent_at > ?",
@@ -302,7 +338,7 @@ def build_report(conn: sqlite3.Connection, cfg: Config, window_hours: int = 24) 
         shelf=_shelf(conn, codes, boards),
         warehouse=_warehouse(conn, cfg.watch),
         changes=_changes(conn, codes, boards, window_hours),
-        sources=_sources(conn),
+        sources=_sources(conn, boards),
         suppressed=suppressed,
     )
 
