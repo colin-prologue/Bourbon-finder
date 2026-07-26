@@ -95,22 +95,40 @@ The tempting move is a `watchlist` table plus a `ncbourbon watch add/rm/ls`
 CLI plus per-user rows. We are not doing that. The site filters in the
 browser, so the server never needs to know who wants what.
 
-What the server does need is the **universe** of interesting products —
-`allocated_list` ∪ (`stock_latest` where listing_type ∈ Allocation/Limited).
-That is derived from the DB and is the same for everyone.
+What the server does need is the **universe** of interesting products:
+
+    allocated_list
+      ∪ (stock_latest where listing_type ∈ Allocation/Limited)
+      ∪ (any stored product whose name matches watch.name_patterns)
+
+That third term is easy to forget and matters. `name_patterns` exists precisely
+so a Pappy bottle the state happens to classify `Listed` or `Barrel` still
+counts, and `diff._watched()` already honours it for warehouse alerts. If the
+report and site derive their universe from listing type alone, a
+pattern-only product becomes alertable but invisible — the two surfaces
+disagree about what is being watched. Patterns match a *name*, and a code's
+name is only known per row, so the universe has to be resolved against stored
+product names rather than from the code lists alone.
+
+The universe is derived from the DB and is the same for everyone.
 
 Email subscribers are the one case that genuinely needs server-side
-preferences, because an inbox can't filter itself. Three neighbors is three
-TOML blocks:
+preferences, because an inbox can't filter itself. Three neighbours is three
+JSON objects — in a **secret**, not in the config file:
 
-```toml
-[[subscribers]]
-name = "Colin"
-email = "colin@prologuegames.com"
-boards = ["durham", "wake", "greensboro"]
-patterns = ["Weller", "Blanton", "E.H. Taylor"]
-urgent = true
 ```
+NCBOURBON_SUBSCRIBERS='[{"name":"Colin","email":"you@example.com",
+                         "boards":["durham","wake","greensboro"],
+                         "patterns":["Weller","Blanton","E.H. Taylor"]}]'
+```
+
+This repository is public and `config.toml` is tracked in it, so a neighbour's
+address must not go there — it is theirs, not ours, and the poll workflow reads
+the checked-out config directly. A `[[subscribers]]` block in `config.toml` is
+supported for a private local checkout only, and the env var wins over it. The
+same reasoning applies downstream: nothing may log a subscriber's address,
+because Actions logs on a public repo are public and GitHub masks the secret as
+a whole rather than the individual addresses inside it.
 
 No table, no CLI, no accounts. If this ever needs to be self-serve, that is
 the moment to add a backend — not before.
@@ -158,8 +176,18 @@ the page should keep working when a CDN doesn't. The page:
   older than its expected refresh interval
 
 Hosting: the repo is public, so GitHub Pages on the free tier works with no
-new accounts or spend. The Actions job renders and deploys after each board
-poll.
+new accounts or spend. The Actions job renders and deploys after **every**
+poll, warehouse runs included.
+
+Publishing only after board polls was the first instinct — shelf data only
+moves three times a day, so why redeploy 72 times? Because the warehouse
+figures are not static between report days: Total Available falls through the
+day as boards order, and that drawdown is the one forward-looking signal left
+since the shipment feed was retired. A page that showed an eight-hour-old
+drawdown while claiming to be the current picture would undercut the whole
+premise. Deploying is a few seconds and three deploys an hour sits well under
+the Pages rate limit, so the freshness is worth more than the tidier
+deployment history.
 
 ## Branch series
 
