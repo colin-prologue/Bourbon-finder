@@ -427,6 +427,46 @@ def test_empty_first_poll_still_establishes_a_board_baseline():
     assert [e.key for e in events] == ["nh:27090"]
 
 
+def test_widening_search_coverage_does_not_fake_restocks():
+    """A code never seen on a board is ambiguous: it just arrived, or we just
+    started looking. Widening the term list announced Crown Royal Chocolate and
+    Sazerac Rye as fresh restocks when they had been on those shelves all along.
+
+    Terms are derived from the allocated list, which the state keeps updating,
+    so this is not a one-off migration cost — it recurs on its own.
+    """
+    from ncbourbon.db import connect
+    from ncbourbon.diff import apply_board_snapshot
+
+    conn = connect(":memory:")
+    narrow, wide = "coverage-aaa", "coverage-bbb"
+
+    # Establish the board under the narrow term set.
+    apply_board_snapshot(conn, _board_rows(("27090", "Blanton's", "s1", 2)),
+                         complete={"greensboro"}, coverage=narrow)
+
+    # Coverage widens: a code we simply never searched for now shows up.
+    events = apply_board_snapshot(
+        conn,
+        _board_rows(("27090", "Blanton's", "s1", 2), ("18605", "Sazerac Rye", "s1", 9)),
+        complete={"greensboro"}, coverage=wide,
+    )
+    assert events == []                       # newly-covered ground, not news
+    assert conn.execute(                      # ...but it IS collected
+        "SELECT qty FROM board_latest WHERE plu='18605'"
+    ).fetchone()[0] == 9
+
+    # Same coverage next run: now a first sighting really is an arrival, because
+    # we searched identically last time and it was not there.
+    events = apply_board_snapshot(
+        conn,
+        _board_rows(("27090", "Blanton's", "s1", 2), ("18605", "Sazerac Rye", "s1", 9),
+                    ("19791", "Weller Full Proof", "s1", 1)),
+        complete={"greensboro"}, coverage=wide,
+    )
+    assert [e.key for e in events] == ["greensboro:19791"]
+
+
 def test_a_failed_scope_does_not_get_a_baseline():
     """Only a scope observed COMPLETELY may establish a baseline. Marking a
     partial run is what makes the missing half look like news on recovery."""

@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 
 from . import alerts as alerts_mod
@@ -187,9 +188,13 @@ def cmd_poll_boards(conn, cfg, session):
         if ok:
             complete.add("greensboro")
         _health(conn, cfg, "greensboro", ok, err)
+    # Fingerprint of what we searched, so the differ can tell "this bottle just
+    # arrived" from "we just started looking for it" — see apply_board_snapshot.
+    coverage = hashlib.sha256("\n".join(sorted(terms)).encode()).hexdigest()[:16]
     events = apply_board_snapshot(
         conn, all_rows, observed=observed,
         alertable=alertable_codes(conn, cfg.watch, all_rows), complete=complete,
+        coverage=coverage,
     )
     _emit(conn, cfg, events)
     log.info("boards: %d store-rows across %d board(s), %d events",

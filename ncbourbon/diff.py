@@ -314,6 +314,7 @@ def apply_board_snapshot(
     observed: set[tuple[str, str]] | None = None,
     alertable: set[str] | None = None,
     complete: set[str] | None = None,
+    coverage: str | None = None,
 ) -> list[Event]:
     """Store-level board inventory. Emits one board_restock per (board, code)
     that went 0 -> >0 at one or more stores — confirmation a rare bottle is on
@@ -351,6 +352,23 @@ def apply_board_snapshot(
         complete = {r.board for r in rows}
     seeded = {b for b in complete if is_seeded(conn, f"board:{b}")}
     seeded |= {b for b, _, _ in prev}   # boards seeded before this table existed
+
+    # A code we have NEVER seen on a board is ambiguous: either it just landed,
+    # or we just started looking for it. Which one depends on whether this run's
+    # search covered the same ground as the last.
+    #
+    # `coverage` is a fingerprint of the terms used. When it is unchanged, we
+    # searched identically last time and found nothing, so a first sighting is a
+    # genuine arrival and should alert. When it changes — and it changes on its
+    # own, because terms are derived from the allocated list the state keeps
+    # updating — first sightings are just newly-covered ground and must be
+    # silent. Without this, widening coverage announced Crown Royal Chocolate
+    # and Sazerac Rye as fresh restocks when they had been sitting on those
+    # shelves all along.
+    widened = {
+        b for b in complete
+        if coverage is not None and not is_seeded(conn, f"coverage:{b}:{coverage}")
+    }
     present = {(r.board, r.plu, r.store) for r in rows}
     restocked: dict[tuple[str, str], list[BoardStoreStock]] = {}
     for r in rows:
@@ -362,7 +380,12 @@ def apply_board_snapshot(
                 "VALUES (?,?,?,?,?,?,?,?)",
                 (r.board, r.plu, r.name, r.price, r.store, r.qty, ts, old),
             )
-        if r.qty > 0 and (old is None or old == 0) and r.board in seeded:
+        first_sighting = old is None
+        if (
+            r.qty > 0
+            and (old == 0 or (first_sighting and r.board not in widened))
+            and r.board in seeded
+        ):
             restocked.setdefault((r.board, r.plu), []).append(r)
         conn.execute(
             "INSERT INTO board_latest (board, plu, store, name, price, qty, updated_at) "
@@ -410,5 +433,7 @@ def apply_board_snapshot(
         )
     for board in complete:
         mark_seeded(conn, f"board:{board}")
+        if coverage is not None:
+            mark_seeded(conn, f"coverage:{board}:{coverage}")
     conn.commit()
     return events
