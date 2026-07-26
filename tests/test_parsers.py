@@ -308,10 +308,10 @@ def test_prune_drops_history_past_the_horizon(tmp_path):
     assert conn.execute("SELECT COUNT(*) FROM board_stock").fetchone()[0] == 1
 
 
-def _board_rows(*specs):
+def _board_rows(*specs, board="greensboro"):
     from ncbourbon.sources.abcgo import BoardStoreStock
 
-    return [BoardStoreStock("greensboro", plu, name, "$60", store, qty)
+    return [BoardStoreStock(board, plu, name, "$60", store, qty)
             for plu, name, store, qty in specs]
 
 
@@ -1517,10 +1517,21 @@ _DURHAM_DETAIL = """
 </body></html>
 """
 
-_DURHAM_SEARCH = """
-<div>
-  <a href="/products/20581?q=eh%20taylor" class="card">E.H. TAYLOR JR. SMALL BATCH In Stock (2)</a>
-  <a href="/products/20581?q=eh%20taylor" class="card">dup link ignored</a>
+# Real card shape: the badge and name are in the *search* fragment, before any
+# detail GET. That is what lets the adapter skip ordinary shelf stock for free.
+def _durham_card(code: str, badge: str, name: str) -> str:
+    return f"""
+  <a href="/products/{code}?q=x" class="card block p-5">
+    <span class="inline-block px-2.5 rounded-full">{badge}</span>
+    <h3 class="text-base font-semibold line-clamp-2">{name}</h3>
+    <p class="text-sm">.75L</p>
+  </a>"""
+
+
+_DURHAM_SEARCH = f"""
+<div class="grid">
+  {_durham_card("20581", "Limited / Allocated", "E.H. TAYLOR JR. SMALL BATCH")}
+  {_durham_card("20581", "Limited / Allocated", "dup link ignored")}
 </div>
 """
 
@@ -1543,7 +1554,7 @@ def test_durham_fetch_end_to_end(monkeypatch):
     from ncbourbon.sources.abcgo import BoardStoreStock
 
     class _Resp:
-        def __init__(self, text): self.text = text
+        def __init__(self, text): self.text, self.status_code = text, 200
 
     def fake_fetch(session, method, url, *, timeout=60, data=None, json=None, headers=None):
         if "/search" in url:
@@ -1553,13 +1564,463 @@ def test_durham_fetch_end_to_end(monkeypatch):
         raise AssertionError("unexpected url " + url)
 
     monkeypatch.setattr(durham, "fetch", fake_fetch)
-    rows = durham.fetch_durham_stock(object(), ["eh taylor"])
+    monkeypatch.setattr(durham.time, "sleep", lambda _s: None)
+    rows, coverage = durham.fetch_durham_stock(object(), ["eh taylor"])
     assert all(isinstance(r, BoardStoreStock) and r.board == "durham" for r in rows)
     assert len(rows) == 2                      # dup /products link deduped -> one code, two stores
     by_store = {r.store: r.qty for r in rows}
     assert by_store["1928 Holloway Street Durham, NC 27703"] == 2
     assert by_store["2806 Hillsborough Road Durham, NC 27705"] == 0
     assert rows[0].plu == "20581" and rows[0].name == "E.H. TAYLOR JR. SMALL BATCH"
+    assert coverage.fetched == coverage.relevant == 1
+    assert coverage.matched == 1 and coverage.classified
+
+
+# A real product page nobody stocks: no <table>, but price and badge intact.
+# 62 of the 127 relevant codes looked like this on 2026-07-26.
+_DURHAM_NO_STORES = """
+<html><body>
+  <h1>Weller Full Proof</h1>
+  <span class="badge">Limited / Allocated</span>
+  <div>PLU 111 &middot; .75L $39.95</div>
+</body></html>
+"""
+
+# Durham's 404. Note it has an <h1> too — the heading alone proves nothing.
+_DURHAM_NOT_FOUND = "<html><body><h1>Product Not Found</h1></body></html>"
+
+
+def _durham_harness(monkeypatch, search_html: str, detail=None, status: int = 200):
+    """Patch durham's fetch + sleep; return the list of detail codes requested."""
+    from ncbourbon.sources import durham
+
+    requested: list[str] = []
+
+    class _Resp:
+        def __init__(self, text, code=200):
+            self.text, self.status_code = text, code
+
+    def fake_fetch(session, method, url, *, timeout=60, data=None, json=None, headers=None):
+        if "/search" in url:
+            return _Resp(search_html)
+        requested.append(url.rsplit("/", 1)[-1])
+        return _Resp(detail if detail is not None else _DURHAM_DETAIL, status)
+
+    monkeypatch.setattr(durham, "fetch", fake_fetch)
+    monkeypatch.setattr(durham.time, "sleep", lambda _s: None)
+    return requested
+
+
+def test_durham_never_fetches_ordinary_shelf_stock(monkeypatch):
+    """The point of reading the badge: 168 of 295 live matches are Bourbon,
+    Vodka, Minis — categories that can never produce an alert. Spending a
+    detail GET on them is what pushed the watched bottles past the cap."""
+    from ncbourbon.sources import durham
+
+    html = f"""<div>
+      {_durham_card("111", "Limited / Allocated", "Weller Full Proof")}
+      {_durham_card("222", "Vodka", "Tito's Handmade")}
+      {_durham_card("333", "Minis", "Fireball 50ml")}
+      {_durham_card("444", "Bourbon", "Jim Beam White")}
+    </div>"""
+    requested = _durham_harness(monkeypatch, html)
+
+    _rows, coverage = durham.fetch_durham_stock(object(), ["x"])
+    assert requested == ["111"]
+    assert coverage.matched == 4        # all four seen...
+    assert coverage.relevant == 1       # ...one worth a request
+    assert coverage.fetched == 1        # no shortfall to report
+    # Skipped is not the same as known: zeroing a code we never looked at would
+    # fabricate a sellout, and then a restock when it reappears.
+    assert coverage.observed == {"111"}
+
+
+def test_durham_sellout_is_observable_when_the_store_table_vanishes(monkeypatch):
+    """A product no store carries renders with no store table at all, so it
+    yields no rows. Treating that as 'not looked at' left the last known
+    quantity standing forever — the bottle reads as in stock indefinitely and
+    can never fire 0 -> >0 again."""
+    from ncbourbon.db import connect
+    from ncbourbon.diff import apply_board_snapshot
+    from ncbourbon.sources import durham
+    from ncbourbon.sources.abcgo import BoardStoreStock
+
+    conn = connect(":memory:")
+    store = "1928 Holloway Street Durham, NC 27703"
+    apply_board_snapshot(conn, [BoardStoreStock("durham", "111", "Weller", "$40", store, 3)])
+
+    # Next run: still relevant, still fetched — but Durham now serves the page
+    # with no <table>, meaning no store carries it. Price and badge stay put,
+    # which is what separates this from an error page.
+    html = f'<div>{_durham_card("111", "Limited / Allocated", "Weller")}</div>'
+    _durham_harness(monkeypatch, html, detail=_DURHAM_NO_STORES)
+
+    rows, coverage = durham.fetch_durham_stock(object(), ["x"])
+    assert rows == [] and coverage.observed == {"111"}
+
+    apply_board_snapshot(conn, rows, observed={("durham", c) for c in coverage.observed})
+    assert conn.execute(
+        "SELECT qty FROM board_latest WHERE board='durham' AND plu='111'"
+    ).fetchone()[0] == 0
+
+    # And the return is news again.
+    events = apply_board_snapshot(
+        conn, [BoardStoreStock("durham", "111", "Weller", "$40", store, 2)],
+        observed={("durham", "111")},
+    )
+    assert [e.kind for e in events] == ["board_restock"]
+
+
+def test_durham_fetches_watched_codes_before_the_ceiling_binds(monkeypatch):
+    """A watch-universe code must survive the ceiling however late it sorts.
+    Before this, the run sliced the first 60 codes in term-alphabetical order
+    and reached 3 of the 11 watched bottles Durham carried."""
+    from ncbourbon.sources import durham
+
+    cards = [_durham_card(str(900 + i), "Limited / Allocated", f"Filler {i}") for i in range(5)]
+    cards.append(_durham_card("20581", "Limited / Allocated", "E.H. TAYLOR JR. SMALL BATCH"))
+    requested = _durham_harness(monkeypatch, f"<div>{''.join(cards)}</div>")
+    monkeypatch.setattr(durham, "MAX_DETAIL_FETCHES", 2)
+
+    _rows, coverage = durham.fetch_durham_stock(
+        object(), ["x"], priority_codes={"20581"}
+    )
+    assert requested[0] == "20581"      # watched code goes first, not last
+    assert len(requested) == 2          # ceiling still honoured
+    assert coverage.relevant == 6 and coverage.fetched == 2   # shortfall is visible
+
+
+def test_durham_name_pattern_matches_off_the_search_card(monkeypatch):
+    """`pattern_matched_codes` resolves patterns against names in board_latest,
+    so a bottle we never fetch can never match one — a closed circle. Reading
+    the name off the search card opens it without spending a request."""
+    from ncbourbon.sources import durham
+
+    html = f"""<div>
+      {_durham_card("555", "Bourbon", "Pappy Van Winkle 15 Year")}
+      {_durham_card("666", "Bourbon", "Evan Williams Black")}
+    </div>"""
+    requested = _durham_harness(monkeypatch, html)
+
+    _rows, coverage = durham.fetch_durham_stock(object(), ["x"], name_patterns=["pappy"])
+    assert requested == ["555"]         # unbadged category, but a watched name
+    assert coverage.relevant == 1
+
+
+@pytest.mark.parametrize(
+    "text, status, label",
+    [
+        ("<html><body><h1>Access Denied</h1></body></html>", 403, "WAF block"),
+        ("<html><body><h1>Server Error</h1></body></html>", 200, "HTTP-200 error page"),
+        # A non-200 is never a search result, whatever the body happens to
+        # contain — a WAF or CDN can serve a cached page that carries the
+        # empty-state text. Status is checked on its own account, not as a
+        # shortcut to the marker check.
+        ('<div><h3>No products found</h3></div>', 403, "403 carrying the empty-state text"),
+    ],
+)
+def test_durham_will_not_read_a_blocked_search_as_no_results(monkeypatch, text, status, label):
+    """A search we could not read is not a search that found nothing. A blocked
+    term used to parse as zero cards, so its products left the `relevant`
+    denominator entirely — and because other terms still supplied badges, the
+    run reported full coverage and healthy status while skipping watched
+    bottles. Silently narrowing the denominator is worse than failing."""
+    from ncbourbon.sources import durham
+
+    _durham_harness(monkeypatch, text, status=status)
+    monkeypatch.setattr(
+        durham, "fetch",
+        lambda s, m, url, **kw: type("R", (), {"text": text, "status_code": status})(),
+    )
+    with pytest.raises(RuntimeError, match="durham search"):
+        durham.fetch_durham_stock(object(), ["weller"])
+
+
+def test_durham_believes_an_empty_search_that_says_it_is_empty(monkeypatch):
+    """The other half: Durham genuinely carries nothing for many watchlist
+    terms, and those runs must not fail. An empty result is believable when the
+    page carries the empty-state marker."""
+    from ncbourbon.sources import durham
+
+    empty = '<div class="text-center py-12"><h3>No products found</h3></div>'
+    requested = _durham_harness(monkeypatch, empty)
+    rows, coverage = durham.fetch_durham_stock(object(), ["nothing here"])
+    assert rows == [] and requested == []
+    assert coverage.matched == 0 and coverage.relevant == 0
+    # An empty set has nothing to classify. Reporting a classification failure
+    # here flagged a healthy, complete poll as needing attention on the site
+    # and in the digest — a false alarm on the most ordinary outcome there is.
+    assert coverage.classified
+
+
+def test_durham_fails_open_when_only_the_name_markup_changes(monkeypatch):
+    """The quiet half of the same failure. If Durham reskins the <h3> but keeps
+    the badge, a pattern-only bottle in an ordinary category misses the regex,
+    falls to tier 3 and is never fetched — restoring the closed circle `_tier`
+    exists to break — while classification still looks healthy, so no coverage
+    signal fires. A name we cannot read is a question we cannot answer, not a
+    no."""
+    from ncbourbon.sources import durham
+
+    # Badge parses, name does not.
+    html = """<div>
+      <a href="/products/555?q=x" class="card"><span>Bourbon</span></a>
+      <a href="/products/666?q=x" class="card"><span>Vodka</span></a>
+    </div>"""
+    requested = _durham_harness(monkeypatch, html)
+    _rows, coverage = durham.fetch_durham_stock(object(), ["x"], name_patterns=["pappy"])
+    assert sorted(requested) == ["555", "666"], "unreadable names must be fetched, not dropped"
+    assert coverage.classified                  # badges were fine — this is the point
+
+    # With no patterns configured there is no question to answer, so ordinary
+    # categories stay tier 3 and cost nothing.
+    requested = _durham_harness(monkeypatch, html)
+    _rows, coverage = durham.fetch_durham_stock(object(), ["x"])
+    assert requested == []
+    assert coverage.relevant == 0
+
+
+def test_durham_fails_open_when_the_badge_markup_changes(monkeypatch):
+    """A classifier that fails closed turns a reskin into silent data loss.
+    Unclassifiable cards get fetched anyway, and the run says it was blind."""
+    from ncbourbon.sources import durham
+
+    html = """<div>
+      <a href="/products/777?q=x" class="card">Weller Full Proof</a>
+      <a href="/products/888?q=x" class="card">Tito's Handmade</a>
+    </div>"""
+    requested = _durham_harness(monkeypatch, html)
+
+    _rows, coverage = durham.fetch_durham_stock(object(), ["x"])
+    assert sorted(requested) == ["777", "888"]      # nothing dropped
+    assert not coverage.classified
+    assert coverage.relevant == coverage.fetched == 2
+
+
+@pytest.mark.parametrize(
+    "detail, status, label",
+    [
+        (_DURHAM_NOT_FOUND, 404, "404 product-not-found"),
+        ("<html><body><h1>Access Denied</h1></body></html>", 403, "WAF block"),
+        # NC ABC sites serve error pages with HTTP 200, so status alone is not
+        # enough to tell a real page from a broken one.
+        ("<html><body><h1>Server Error</h1></body></html>", 200, "HTTP-200 error page"),
+    ],
+)
+def test_durham_will_not_call_an_unreadable_page_a_sellout(monkeypatch, detail, status, label):
+    """The dangerous ambiguity: an error page and a genuine "nobody stocks it"
+    both parse to zero stores. Treating the former as authoritative zeroes every
+    store for that code, and the next healthy poll fires a burst of false
+    board_restock alerts — sending someone driving for a bottle that never
+    moved. Polls run from GitHub Actions, whose IPs do get WAF-blocked."""
+    from ncbourbon.db import connect
+    from ncbourbon.diff import apply_board_snapshot
+    from ncbourbon.sources import durham
+    from ncbourbon.sources.abcgo import BoardStoreStock
+
+    conn = connect(":memory:")
+    store = "1928 Holloway Street Durham, NC 27703"
+    apply_board_snapshot(conn, [BoardStoreStock("durham", "111", "Weller", "$40", store, 3)])
+
+    html = f'<div>{_durham_card("111", "Limited / Allocated", "Weller")}</div>'
+    _durham_harness(monkeypatch, html, detail=detail, status=status)
+
+    rows, coverage = durham.fetch_durham_stock(object(), ["x"])
+    assert rows == []
+    assert coverage.observed == set(), f"{label} must not be authoritative"
+    # A page we could not read is not a page we read: the shortfall is visible.
+    assert coverage.fetched == 0 and coverage.relevant == 1
+
+    apply_board_snapshot(conn, rows, observed={("durham", c) for c in coverage.observed})
+    assert conn.execute(
+        "SELECT qty FROM board_latest WHERE board='durham' AND plu='111'"
+    ).fetchone()[0] == 3, "stale beats fabricated — the known quantity stands"
+
+
+def test_a_board_that_knows_its_coverage_reports_it_per_code():
+    """Durham chooses which codes to spend a request on, so "not fetched" really
+    does mean "not covered" — unlike ABC/GO, where a code missing from the
+    results was searched for and genuinely absent.
+
+    A term fingerprint cannot express that. It only sees the inputs it is built
+    from, so promoting a code into the fetch set on any other axis — a new entry
+    in the watch universe, an edited name pattern — slips past it, and the
+    bottle's first fetched row reads as a fresh arrival. Stating coverage per
+    code removes the guess."""
+    from ncbourbon.db import connect, is_seeded
+    from ncbourbon.diff import apply_board_snapshot
+
+    conn = connect(":memory:")
+    fp = "terms-unchanged"
+
+    # Run 1 establishes the board. Durham looked at 111 only.
+    apply_board_snapshot(conn, _board_rows(("111", "Weller", "s1", 2), board="durham"),
+                         complete={"durham"}, coverage=fp, covered={"durham": {"111"}})
+    assert is_seeded(conn, "covered:durham:111")
+
+    # Run 2: 222 is promoted into the fetch set and turns out to be on a shelf.
+    # Terms never changed, so the fingerprint is identical — the old rule would
+    # have called this an arrival. We had simply never looked at it.
+    events = apply_board_snapshot(
+        conn, _board_rows(("111", "Weller", "s1", 2), ("222", "Sazerac Rye", "s1", 9), board="durham"),
+        complete={"durham"}, coverage=fp, covered={"durham": {"111", "222"}},
+    )
+    assert events == []
+    assert conn.execute(                       # still collected, just not announced
+        "SELECT qty FROM board_latest WHERE plu='222'").fetchone()[0] == 9
+
+    # Run 3: 333 is now in the fetch set and we looked at it — nothing there.
+    # It yields no row at all, which is what a Durham page with no store table
+    # looks like. Silence is right: it is not on a shelf.
+    events = apply_board_snapshot(
+        conn, _board_rows(("111", "Weller", "s1", 2), board="durham"),
+        complete={"durham"}, coverage=fp, covered={"durham": {"111", "222", "333"}},
+    )
+    assert events == []
+
+    # Run 4 is the case the whole mechanism exists to still allow. 333 was
+    # covered last run and was genuinely absent; now it is on a shelf. That is a
+    # real arrival and MUST alert — a ledger that silences this is just a mute
+    # button.
+    events = apply_board_snapshot(
+        conn, _board_rows(("111", "Weller", "s1", 2), ("333", "Blanton's", "s1", 1),
+                          board="durham"),
+        complete={"durham"}, coverage=fp, covered={"durham": {"111", "222", "333"}},
+    )
+    assert [e.key for e in events] == ["durham:333"]
+
+
+def test_newly_covered_ground_is_silent_on_every_surface(monkeypatch):
+    """Suppressing the alert is not enough. History rows carry `prev_qty`, and a
+    NULL prev on a positive row classifies as a crossing up from zero — so a
+    newly-covered bottle stayed out of the email while the digest and the site
+    still announced it as having appeared. A quieter surface disagreeing with a
+    louder one is not a fix, it is a second answer to the same question."""
+    from datetime import datetime, timedelta, timezone
+
+    from ncbourbon.db import connect
+    from ncbourbon import diff as diff_mod
+    from ncbourbon.diff import apply_board_snapshot
+    from ncbourbon.report import _changes
+
+    # board_stock is keyed on observed_at, so several polls inside one second
+    # collide on INSERT OR IGNORE and the later rows vanish. Real polls are
+    # hours apart; step the clock so the test measures the code, not the clock.
+    clock = iter(
+        (datetime.now(timezone.utc) - timedelta(hours=h)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for h in (6, 5, 4, 3, 2, 1)
+    )
+    monkeypatch.setattr(diff_mod, "now_iso", lambda: next(clock))
+
+    conn = connect(":memory:")
+    fp = "terms-unchanged"
+    apply_board_snapshot(conn, _board_rows(("111", "Weller", "s1", 2), board="durham"),
+                         complete={"durham"}, coverage=fp, covered={"durham": {"111"}})
+
+    # 222 is promoted into the fetch set and is already on a shelf.
+    events = apply_board_snapshot(
+        conn, _board_rows(("111", "Weller", "s1", 2), ("222", "Sazerac Rye", "s1", 9),
+                          board="durham"),
+        complete={"durham"}, coverage=fp, covered={"durham": {"111", "222"}},
+    )
+    assert events == []                                   # no alert...
+    changes = _changes(conn, {"111", "222"}, {"durham"}, 24)
+    assert [c.nc_code for c in changes if c.kind == "on_shelf"] == [], (
+        "...and no 'appeared' in the report either"
+    )
+    assert conn.execute(                                  # still collected
+        "SELECT qty FROM board_latest WHERE plu='222'").fetchone()[0] == 9
+
+    # It sells out — Durham reports the store at 0 rather than dropping it.
+    apply_board_snapshot(
+        conn, _board_rows(("111", "Weller", "s1", 2), ("222", "Sazerac Rye", "s1", 0),
+                          board="durham"),
+        complete={"durham"}, coverage=fp, covered={"durham": {"111", "222", "333"}},
+    )
+    events = apply_board_snapshot(
+        conn, _board_rows(("111", "Weller", "s1", 2), ("222", "Sazerac Rye", "s1", 4),
+                          board="durham"),
+        complete={"durham"}, coverage=fp, covered={"durham": {"111", "222", "333"}},
+    )
+    assert [e.key for e in events] == ["durham:222"]
+    changes = _changes(conn, {"111", "222"}, {"durham"}, 24)
+    assert "222" in [c.nc_code for c in changes if c.kind == "on_shelf"]
+
+    # The mirror case, and the one that makes this a fix rather than a mute:
+    # 333 was covered last run and genuinely absent — so it has NO prior row at
+    # all, and its arrival is a first sighting. Suppressing history for every
+    # first sighting would keep this out of the report while still emailing it,
+    # which is the same disagreement pointing the other way.
+    events = apply_board_snapshot(
+        conn, _board_rows(("111", "Weller", "s1", 2), ("333", "Blanton's", "s1", 1),
+                          board="durham"),
+        complete={"durham"}, coverage=fp, covered={"durham": {"111", "222", "333"}},
+    )
+    assert [e.key for e in events] == ["durham:333"]
+    changes = _changes(conn, {"111", "222", "333"}, {"durham"}, 24)
+    assert "333" in [c.nc_code for c in changes if c.kind == "on_shelf"], (
+        "a covered code's first sighting is a real arrival and belongs in the report"
+    )
+
+
+def test_term_driven_boards_keep_the_fingerprint():
+    """The per-code ledger must NOT be applied to boards whose coverage is a
+    query rather than a list. ABC/GO and Greensboro return only in-stock
+    products, so a code absent from the results was still covered — searched for
+    and not there. Treating absence as "never looked" would silence every real
+    arrival on those boards, permanently."""
+    from ncbourbon.db import connect
+    from ncbourbon.diff import apply_board_snapshot
+
+    conn = connect(":memory:")
+    fp = "terms-v1"
+    apply_board_snapshot(conn, _board_rows(("27090", "Blanton's", "s1", 2)),
+                         complete={"greensboro"}, coverage=fp)
+    # Same terms, and a code that was searched for last run and simply absent.
+    # No `covered` for greensboro, so the fingerprint still decides — and says
+    # this is a genuine arrival.
+    events = apply_board_snapshot(
+        conn, _board_rows(("27090", "Blanton's", "s1", 2), ("19791", "Weller", "s1", 1)),
+        complete={"greensboro"}, coverage=fp,
+    )
+    assert [e.key for e in events] == ["greensboro:19791"]
+
+
+def test_report_shows_a_partial_read_not_just_a_green_light(monkeypatch):
+    """A capped source succeeds and looks healthy. `last_ok` cannot express
+    'read 60 of 127', so the shortfall has to ride alongside it."""
+    from ncbourbon.config import Config
+    from ncbourbon.db import record_coverage, record_health
+    from ncbourbon.report import build_report, render_text
+
+    conn = _report_fixture_db()
+    record_health(conn, "durham", True)
+    record_health(conn, "greensboro", True)
+    record_coverage(conn, "durham", fetched=60, relevant=127)
+    record_coverage(conn, "greensboro", fetched=40, relevant=40)
+
+    cfg = Config()
+    cfg.boards.abcgo_boards = []
+    report = build_report(conn, cfg)
+    sources = {s.source: s for s in report.sources}
+    assert sources["durham"].note == "partial coverage: read 60 of 127 relevant items"
+    assert sources["greensboro"].note == ""         # complete read stays quiet
+    assert not sources["durham"].stale              # succeeded just now...
+    assert "read 60 of 127" in render_text(report)  # ...but a human still sees it
+
+    # A source that could not classify its results says so too.
+    record_coverage(conn, "durham", fetched=295, relevant=295, classified=False)
+    sources = {s.source: s for s in build_report(conn, cfg).sources}
+    assert sources["durham"].note == "could not classify results — read unfiltered"
+
+    # And when it also hit its ceiling, both facts survive. Falling back to
+    # reading everything is exactly when the ceiling is most likely to bind, so
+    # reporting only the classification failure would call a capped read
+    # complete in the one case the flag exists to diagnose.
+    record_coverage(conn, "durham", fetched=150, relevant=295, classified=False)
+    note = {s.source: s for s in build_report(conn, cfg).sources}["durham"].note
+    assert "could not classify" in note
+    assert "read 150 of 295" in note
 
 
 # --- Greensboro board adapter (added 2026-07-22) ----------------------------

@@ -100,6 +100,17 @@ CREATE TABLE IF NOT EXISTS seeded (
   scope TEXT PRIMARY KEY,
   first_seen TEXT NOT NULL
 );
+-- How much of what a source *could* have read it actually read on its last
+-- run. Separate from `health` because a partial read is not a failure: health
+-- drives the consecutive-failure alert, and folding coverage into last_error
+-- would either cry wolf or be ignored. Read by report._sources.
+CREATE TABLE IF NOT EXISTS source_coverage (
+  source TEXT PRIMARY KEY,
+  fetched INTEGER,
+  relevant INTEGER,
+  classified INTEGER,
+  updated_at TEXT
+);
 CREATE TABLE IF NOT EXISTS health (
   source TEXT PRIMARY KEY,
   last_ok TEXT,
@@ -321,6 +332,19 @@ def mark_seeded(conn: sqlite3.Connection, scope: str) -> None:
     conn.execute(
         "INSERT OR IGNORE INTO seeded (scope, first_seen) VALUES (?,?)", (scope, now_iso())
     )
+
+
+def record_coverage(
+    conn: sqlite3.Connection, source: str, fetched: int, relevant: int, classified: bool = True
+) -> None:
+    """Record how much of what `source` could read it actually read."""
+    conn.execute(
+        "INSERT INTO source_coverage (source, fetched, relevant, classified, updated_at) "
+        "VALUES (?,?,?,?,?) ON CONFLICT(source) DO UPDATE SET fetched=excluded.fetched, "
+        "relevant=excluded.relevant, classified=excluded.classified, updated_at=excluded.updated_at",
+        (source, fetched, relevant, 1 if classified else 0, now_iso()),
+    )
+    conn.commit()
 
 
 def recently_alerted(conn: sqlite3.Connection, kind: str, key: str, cooldown_hours: float) -> bool:

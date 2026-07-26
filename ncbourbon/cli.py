@@ -21,7 +21,7 @@ import re
 from . import alerts as alerts_mod
 from .alerts import alert, send_digest
 from .config import load_config
-from .db import connect, now_iso, record_health
+from .db import connect, now_iso, record_coverage, record_health
 from .db import prune as db_prune
 from .diff import (
     alertable_codes,
@@ -30,6 +30,7 @@ from .diff import (
     apply_shipments,
     apply_stock_snapshot,
     apply_wake_snapshot,
+    watch_codes,
 )
 from .http import make_session
 from .report import build_report, render_text
@@ -172,6 +173,7 @@ def cmd_poll_boards(conn, cfg, session):
     all_rows = []
     observed: set[tuple[str, str]] = set()   # (board, code) whose per-store state we know this run
     complete: set[str] = set()               # boards that fetched cleanly -> may establish a baseline
+    covered: dict[str, set[str]] = {}        # boards that know their coverage per code, not by term
     for board in cfg.boards.abcgo_boards:
         ok, err = True, ""
         try:
@@ -210,7 +212,25 @@ def cmd_poll_boards(conn, cfg, session):
     if cfg.boards.durham:
         ok, err = True, ""
         try:
-            all_rows.extend(durham.fetch_durham_stock(session, terms, timeout=cfg.request_timeout))
+            # Durham's product code is the NC code, so the watch universe can be
+            # handed straight to the adapter as fetch priority — its per-run
+            # request ceiling then only ever costs us unwatched bottles.
+            durham_rows, coverage = durham.fetch_durham_stock(
+                session,
+                terms,
+                priority_codes=watch_codes(conn, cfg.watch),
+                name_patterns=cfg.watch.name_patterns,
+                timeout=cfg.request_timeout,
+            )
+            all_rows.extend(durham_rows)
+            observed |= {("durham", code) for code in coverage.observed}
+            # Durham chooses which codes to look at, so it can state its
+            # coverage exactly rather than leaving the differ to infer it from
+            # a fingerprint of the search terms.
+            covered["durham"] = set(coverage.observed)
+            record_coverage(
+                conn, "durham", coverage.fetched, coverage.relevant, coverage.classified
+            )
         except Exception as exc:  # noqa: BLE001
             ok, err = False, str(exc)
             log.warning("durham board failed: %s", exc, exc_info=True)
@@ -233,7 +253,7 @@ def cmd_poll_boards(conn, cfg, session):
     events = apply_board_snapshot(
         conn, all_rows, observed=observed,
         alertable=alertable_codes(conn, cfg.watch, all_rows), complete=complete,
-        coverage=coverage,
+        coverage=coverage, covered=covered,
     )
     _emit(conn, cfg, events)
     log.info("boards: %d store-rows across %d board(s), %d events",
