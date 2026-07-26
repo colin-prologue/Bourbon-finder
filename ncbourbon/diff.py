@@ -1,16 +1,35 @@
 """Change detection: turn snapshots into alert-worthy events.
 
-Alert policy (per Colin's choices): instant email only for items whose
-Listing Type is Allocation or Limited (plus optional name-pattern matches);
-everything else rides the daily digest.
+Alert policy: instant email only for items whose Listing Type is Allocation
+or Limited, or which appear on the state's official allocated list, or whose
+name matches a configured pattern. Everything else rides the report.
+
+Three rules keep the volume honest, all of them learned the hard way from six
+days of production (5,994 alerts, of which ~97% were noise):
+
+1. **Store everything, alert on little.** Every row a source returns is
+   persisted — the report and the site want the whole inventory picture. Only
+   codes in the watch universe produce an *event*. Board search APIs match
+   loosely: of the 285 codes Greensboro's search returned for a bourbon
+   watchlist, 28 were actually allocated. The rest were Crystal Head Vodka
+   and friends.
+
+2. **One event per product, not per store.** A county delivery puts a bottle
+   on 13 shelves at once; that is one thing happening, and the stores belong
+   in the body. Per-store keys also defeated the cooldown, which includes the
+   key.
+
+3. **Seeding is not news.** The first observation of a source has nothing to
+   diff against, so every row looks new — 4,186 emails on the first
+   poll-catalog. A scope with no prior state is persisted silently.
 
 Events:
   stock_new       — watched item appears with stock > 0 (was absent or 0)
   stock_drawdown  — watched item's Total Available fell by >= drawdown_alert_fraction
-  stock_gone      — watched item went to 0 (informational, digest-tier by default)
   catalog_new     — brand-new NC Code in Special Items / price list / new items
   shipment        — bottles of a watched code shipped to a watched board
-  wake_restock    — Wake ABC store-level qty went 0 -> >0 for a watched PLU
+  board_restock   — watched code went 0 -> >0 at one or more stores of a board
+  wake_restock    — same, for the legacy standalone Wake path
 """
 from __future__ import annotations
 
@@ -19,7 +38,7 @@ import sqlite3
 from dataclasses import dataclass
 
 from .config import WatchConfig
-from .db import now_iso
+from .db import is_seeded, mark_seeded, now_iso
 from .sources.stocks import StockRow
 from .sources.abcgo import BoardStoreStock
 from .sources.wake import WakeStoreStock
@@ -36,7 +55,45 @@ class Event:
 def _watched(row: StockRow, watch: WatchConfig) -> bool:
     if row.listing_type in watch.listing_types:
         return True
-    return any(re.search(p, row.brand_name, re.I) for p in watch.name_patterns)
+    return name_watched(row.brand_name, watch)
+
+
+def name_watched(name: str, watch: WatchConfig) -> bool:
+    return any(re.search(p, name or "", re.I) for p in watch.name_patterns)
+
+
+def watch_codes(conn: sqlite3.Connection, watch: WatchConfig) -> set[str]:
+    """The universe of NC codes worth interrupting someone for.
+
+    Two sources, deliberately unioned rather than intersected: the warehouse's
+    current Allocation/Limited flags (what the state says is scarce today) and
+    the official allocated/limited list (which carries items not presently in
+    the warehouse, so a board can shelve one we'd otherwise miss).
+
+    Name-pattern matches are not resolvable to codes here — patterns match a
+    product name, and a code's name is only known per row — so callers pass
+    rows through `name_watched` as well. See `alertable_codes`.
+    """
+    codes: set[str] = set()
+    if watch.listing_types:
+        placeholders = ",".join("?" * len(watch.listing_types))
+        codes |= {
+            r["nc_code"]
+            for r in conn.execute(
+                f"SELECT nc_code FROM stock_latest WHERE listing_type IN ({placeholders})",
+                watch.listing_types,
+            )
+        }
+    codes |= {r["nc_code"] for r in conn.execute("SELECT nc_code FROM allocated_list")}
+    return codes
+
+
+def alertable_codes(conn: sqlite3.Connection, watch: WatchConfig, rows) -> set[str]:
+    """`watch_codes` plus any code among `rows` whose product name matches a
+    configured pattern. Computed once per poll and handed to the appliers."""
+    codes = watch_codes(conn, watch)
+    codes |= {r.plu for r in rows if name_watched(getattr(r, "name", ""), watch)}
+    return codes
 
 
 def apply_stock_snapshot(
@@ -49,6 +106,7 @@ def apply_stock_snapshot(
         r["nc_code"]: dict(r)
         for r in conn.execute("SELECT * FROM stock_latest").fetchall()
     }
+    seeding = not prev  # first ever poll: nothing to diff against, so nothing is news
     for row in rows:
         conn.execute(
             "INSERT OR REPLACE INTO warehouse_snapshot VALUES (?,?,?,?,?,?,?,?,?,?,?)",
@@ -60,7 +118,7 @@ def apply_stock_snapshot(
         )
         old = prev.get(row.nc_code)
         old_avail = old["total_available"] if old else None
-        if _watched(row, watch):
+        if _watched(row, watch) and not seeding:
             label = f"{row.brand_name} ({row.nc_code}, {row.listing_type})"
             if row.total_available > 0 and (old_avail is None or old_avail == 0):
                 events.append(
@@ -100,9 +158,20 @@ def apply_stock_snapshot(
     return events
 
 
-def apply_catalog_items(conn: sqlite3.Connection, items, watch: WatchConfig) -> list[Event]:
+def apply_catalog_items(
+    conn: sqlite3.Connection, items, watch: WatchConfig, complete: set[str] | None = None
+) -> list[Event]:
     events: list[Event] = []
     ts = now_iso()
+    # Seeding is tracked per feed against the `seeded` table, not inferred from
+    # the catalog's contents. poll-catalog pulls special_items and new_items
+    # independently and persists whatever succeeded, and catalog rows are
+    # deduplicated by nc_code — so a feed whose codes were all already inserted
+    # by the other feed leaves no trace of itself and would look unseeded
+    # forever. `complete` is the set of feeds that actually fetched cleanly this
+    # run; only those may establish a baseline.
+    if complete is None:
+        complete = {it.source for it in items}
     for it in items:
         exists = conn.execute("SELECT 1 FROM catalog WHERE nc_code=?", (it.nc_code,)).fetchone()
         if exists:
@@ -112,8 +181,9 @@ def apply_catalog_items(conn: sqlite3.Connection, items, watch: WatchConfig) -> 
             "VALUES (?,?,?,?,?)",
             (it.nc_code, it.brand_name, it.source, it.retail_price, ts),
         )
-        interesting = any(re.search(p, it.brand_name, re.I) for p in watch.name_patterns)
-        if it.source in ("special_items", "new_items") or interesting:
+        interesting = name_watched(it.brand_name, watch)
+        seeding = not is_seeded(conn, f"catalog:{it.source}")
+        if not seeding and (it.source in ("special_items", "new_items") or interesting):
             events.append(
                 Event(
                     "catalog_new",
@@ -124,6 +194,8 @@ def apply_catalog_items(conn: sqlite3.Connection, items, watch: WatchConfig) -> 
                     "this item is entering the NC system.",
                 )
             )
+    for source in complete:
+        mark_seeded(conn, f"catalog:{source}")
     conn.commit()
     return events
 
@@ -151,7 +223,15 @@ def apply_shipments(conn: sqlite3.Connection, rows, watch_codes: set[str], watch
     return events
 
 
-def apply_wake_snapshot(conn: sqlite3.Connection, rows: list[WakeStoreStock]) -> list[Event]:
+def apply_wake_snapshot(
+    conn: sqlite3.Connection,
+    rows: list[WakeStoreStock],
+    alertable: set[str] | None = None,
+    complete: bool = True,
+    coverage: str | None = None,
+) -> list[Event]:
+    """Legacy standalone Wake path. Same three rules as apply_board_snapshot:
+    persist every row, alert once per product, stay silent while seeding."""
     events: list[Event] = []
     ts = now_iso()
     prev = {
@@ -178,6 +258,17 @@ def apply_wake_snapshot(conn: sqlite3.Connection, rows: list[WakeStoreStock]) ->
                     (ts, plu, store),
                 )
                 prev[(plu, store)] = (0, _price)
+    # `complete` is False when some search term failed this run. Wake is polled
+    # term by term and partial results are persisted, so treating a partial run
+    # as the baseline would make the missing terms' existing stock read as
+    # restocks the moment they recover.
+    seeding = not is_seeded(conn, "wake")
+    # Wake's terms are static config rather than derived, but editing them has
+    # exactly the same effect as widening board coverage: products that were
+    # never searched suddenly appear, and a first sighting is indistinguishable
+    # from an arrival. Same fingerprint rule as apply_board_snapshot.
+    widened = coverage is not None and not is_seeded(conn, f"coverage:wake:{coverage}")
+    restocked: dict[str, list[WakeStoreStock]] = {}
     for r in rows:
         old_qty, old_price = prev.get((r.plu, r.store), (None, None))
         old = old_qty
@@ -190,23 +281,42 @@ def apply_wake_snapshot(conn: sqlite3.Connection, rows: list[WakeStoreStock]) ->
                 "VALUES (?,?,?,?,?,?,?)",
                 (r.plu, r.name, r.price, r.store, r.qty, ts, old_qty),
             )
-        if r.store != "__ALL__" and r.qty > 0 and (old is None or old == 0):
-            events.append(
-                Event(
-                    "wake_restock",
-                    f"{r.plu}:{r.store}",
-                    f"[Wake ABC] In stock: {r.name}",
-                    f"{r.name} (PLU {r.plu}, {r.price})\n{r.qty} in stock @ {r.store}\n"
-                    "Reminder: Wake refreshes inventory only a couple times a day; "
-                    "bottles may already be gone.",
-                )
-            )
+        if (
+            r.store != "__ALL__"
+            and r.qty > 0
+            and (old == 0 or (old is None and not widened))
+            and not seeding
+        ):
+            restocked.setdefault(r.plu, []).append(r)
         conn.execute(
             "INSERT INTO wake_latest (plu, store, name, qty, updated_at, price) VALUES (?,?,?,?,?,?) "
             "ON CONFLICT(plu, store) DO UPDATE SET qty=excluded.qty, name=excluded.name, "
             "updated_at=excluded.updated_at, price=excluded.price",
             (r.plu, r.store, r.name, r.qty, ts, r.price),
         )
+    for plu, hits in sorted(restocked.items()):
+        if alertable is not None and plu not in alertable:
+            continue
+        first = hits[0]
+        where = "\n".join(
+            f"  {h.qty} @ {h.store}" for h in sorted(hits, key=lambda h: -h.qty)
+        )
+        stores = f"{len(hits)} store{'s' if len(hits) != 1 else ''}"
+        events.append(
+            Event(
+                "wake_restock",
+                plu,
+                f"[Wake ABC] In stock: {first.name} ({stores})",
+                f"{first.name} (PLU {plu}, {first.price})\n"
+                f"Now in stock at {stores}:\n{where}\n\n"
+                "Wake refreshes inventory only a couple of times a day; "
+                "bottles may already be gone.",
+            )
+        )
+    if complete:
+        mark_seeded(conn, "wake")
+        if coverage is not None:
+            mark_seeded(conn, f"coverage:wake:{coverage}")
     conn.commit()
     return events
 
@@ -215,10 +325,19 @@ def apply_board_snapshot(
     conn: sqlite3.Connection,
     rows: list[BoardStoreStock],
     observed: set[tuple[str, str]] | None = None,
+    alertable: set[str] | None = None,
+    complete: set[str] | None = None,
+    coverage: str | None = None,
 ) -> list[Event]:
-    """Store-level board inventory (ABC/GO). Emits board_restock when a
-    (board, plu, store) goes 0 -> >0 — confirmation a rare bottle is on a
-    shelf now. Stage B of the two-stage model (stage A = warehouse arrival).
+    """Store-level board inventory. Emits one board_restock per (board, code)
+    that went 0 -> >0 at one or more stores — confirmation a rare bottle is on
+    a shelf now. Stage B of the two-stage model (stage A = warehouse arrival).
+
+    Every row is persisted regardless; `alertable` (from `alertable_codes`)
+    gates only which codes produce an *event*. Board search APIs match loosely,
+    so most of what comes back is not something anyone asked to watch.
+    `alertable=None` means alert on everything — the legacy behaviour, kept for
+    tests that exercise the diff independently of the watchlist.
 
     `observed` is the set of (board, plu) codes whose current per-store state was
     authoritatively determined this run (searched *or* re-queried). For those
@@ -235,7 +354,36 @@ def apply_board_snapshot(
         (r["board"], r["plu"], r["store"]): r["qty"]
         for r in conn.execute("SELECT board, plu, store, qty FROM board_latest").fetchall()
     }
+    # A board's first complete observation is its baseline: the whole current
+    # inventory would otherwise read as one giant restock. This is recorded in
+    # `seeded` rather than inferred from board_latest, because a first poll that
+    # legitimately returns nothing produces no rows — and for ABC/GO, which only
+    # returns products with positive on-hand, that is the normal case. Inferring
+    # from rows meant such a board never got a baseline, so the *second* poll's
+    # genuine restocks were swallowed as "still seeding".
+    if complete is None:
+        complete = {r.board for r in rows}
+    seeded = {b for b in complete if is_seeded(conn, f"board:{b}")}
+    seeded |= {b for b, _, _ in prev}   # boards seeded before this table existed
+
+    # A code we have NEVER seen on a board is ambiguous: either it just landed,
+    # or we just started looking for it. Which one depends on whether this run's
+    # search covered the same ground as the last.
+    #
+    # `coverage` is a fingerprint of the terms used. When it is unchanged, we
+    # searched identically last time and found nothing, so a first sighting is a
+    # genuine arrival and should alert. When it changes — and it changes on its
+    # own, because terms are derived from the allocated list the state keeps
+    # updating — first sightings are just newly-covered ground and must be
+    # silent. Without this, widening coverage announced Crown Royal Chocolate
+    # and Sazerac Rye as fresh restocks when they had been sitting on those
+    # shelves all along.
+    widened = {
+        b for b in complete
+        if coverage is not None and not is_seeded(conn, f"coverage:{b}:{coverage}")
+    }
     present = {(r.board, r.plu, r.store) for r in rows}
+    restocked: dict[tuple[str, str], list[BoardStoreStock]] = {}
     for r in rows:
         old = prev.get((r.board, r.plu, r.store))
         if old != r.qty:  # history records changes, not re-readings of the same number
@@ -245,20 +393,13 @@ def apply_board_snapshot(
                 "VALUES (?,?,?,?,?,?,?,?)",
                 (r.board, r.plu, r.name, r.price, r.store, r.qty, ts, old),
             )
-        if r.qty > 0 and (old is None or old == 0):
-            price = f", {r.price}" if r.price else ""
-            where = r.store_display or r.store  # stable key vs. human label
-            events.append(
-                Event(
-                    "board_restock",
-                    f"{r.board}:{r.plu}:{r.store}",
-                    f"[{r.board.upper()} ABC] On shelf: {r.name}",
-                    f"{r.name} (NC {r.plu}{price})\n"
-                    f"{r.qty} on hand @ {where}\n"
-                    f"Live per-store confirmation via {r.board}.abcgo.app — "
-                    "bottles can be pre-claimed by mixed-beverage accounts, so move fast.",
-                )
-            )
+        first_sighting = old is None
+        if (
+            r.qty > 0
+            and (old == 0 or (first_sighting and r.board not in widened))
+            and r.board in seeded
+        ):
+            restocked.setdefault((r.board, r.plu), []).append(r)
         conn.execute(
             "INSERT INTO board_latest (board, plu, store, name, price, qty, updated_at) "
             "VALUES (?,?,?,?,?,?,?) ON CONFLICT(board, plu, store) DO UPDATE SET "
@@ -281,5 +422,31 @@ def apply_board_snapshot(
                     "WHERE board=? AND plu=? AND store=?",
                     (ts, board, plu, store),
                 )
+    for (board, plu), hits in sorted(restocked.items()):
+        if alertable is not None and plu not in alertable:
+            continue
+        first = hits[0]
+        price = f", {first.price}" if first.price else ""
+        where = "\n".join(
+            f"  {h.qty} @ {h.store_display or h.store}"
+            for h in sorted(hits, key=lambda h: -h.qty)
+        )
+        stores = f"{len(hits)} store{'s' if len(hits) != 1 else ''}"
+        events.append(
+            Event(
+                "board_restock",
+                f"{board}:{plu}",
+                f"[{board.upper()} ABC] On shelf: {first.name} ({stores})",
+                f"{first.name} (NC {plu}{price})\n"
+                f"Now on the shelf at {stores}:\n{where}\n\n"
+                "Boards refresh their own inventory only a couple of times a day, "
+                "and bottles can be pre-claimed by mixed-beverage accounts — treat "
+                "this as a picture, not a starting gun.",
+            )
+        )
+    for board in complete:
+        mark_seeded(conn, f"board:{board}")
+        if coverage is not None:
+            mark_seeded(conn, f"coverage:{board}:{coverage}")
     conn.commit()
     return events

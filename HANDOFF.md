@@ -88,7 +88,7 @@ Pattern: only metro e-commerce boards whose platform exposes allocated bottles +
 
 ## Gotchas / lessons
 - Warehouse report for *today* (NC calendar day) can be empty until generated; `stocks.nc_today()` computes the date in America/New_York and `fetch_and_parse()` falls back to the previous day. Keep this — a UTC scheduler otherwise requests a not-yet-existing report.
-- First `poll-catalog` run baseline-seeds ~hundreds of "new listing" emails (one per existing Special Items row). Expected once. A Gmail filter (from/to self + subject `[NC]` + body "NC Code" → label + skip inbox) was set up to corral alerts.
+- First run of any source now seeds **silently** — a scope with no prior state has nothing to diff, so treating every row as new was never information. (It used to emit one email per pre-existing row: 4,186 on the first `poll-catalog`.) A Gmail filter (from/to self + subject `[NC]` + body "NC Code" → label + skip inbox) was set up to corral alerts and can probably be retired.
 - Broker Name on the warehouse report is the supplier's sales rep (a person), NOT a store — irrelevant to routing. It is already absent from the alert email body.
 
 ## Immediate next steps

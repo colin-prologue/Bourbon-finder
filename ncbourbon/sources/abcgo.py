@@ -79,9 +79,22 @@ def _json_list(resp) -> list[dict]:
 
 def search(session, board: str, term: str, timeout: int = 60) -> list[dict]:
     """Board-level product search. Returns raw dicts (Code/Brand/OnHand/...)."""
+    rows, _trusted = search_trusted(session, board, term, timeout=timeout)
+    return rows
+
+
+def search_trusted(session, board: str, term: str, timeout: int = 60) -> tuple[list[dict], bool]:
+    """Like `search` but reports whether the answer was authoritative.
+
+    A 403 WAF page or non-JSON body parses to an empty list, which is
+    indistinguishable from "this board genuinely stocks nothing matching". That
+    conflation is the same one that caused issue #2 on the details path, and it
+    matters again for seeding: a failed first search that looks empty would
+    establish an empty baseline, so the board's real inventory reads as a burst
+    of restocks the moment the search recovers."""
     url = HOST_TEMPLATE.format(board=board) + SEARCH_PATH
     resp = fetch(session, "POST", url, json={"filter": term}, headers=API_HEADERS, timeout=timeout)
-    return _json_list(resp)
+    return _json_list_trusted(resp)
 
 
 def details(session, board: str, code: str, timeout: int = 60) -> list[dict]:
@@ -143,16 +156,26 @@ def details_to_stock(board: str, code: str, name: str, price: str, rows: list[di
     return out
 
 
-def fetch_board_stock(session, board: str, terms: list[str], timeout: int = 60) -> list[BoardStoreStock]:
+def fetch_board_stock(
+    session, board: str, terms: list[str], timeout: int = 60
+) -> tuple[list[BoardStoreStock], bool]:
     """For each search term, find matching products on this board, then pull
-    per-store detail for any with OnHand>0. Returns flat per-store rows.
+    per-store detail for any with OnHand>0.
+
+    Returns `(rows, trusted)`. `trusted` is True only when EVERY search this run
+    came back authoritative; one blocked term is enough to make the run an
+    unreliable picture of the board, which the caller needs to know before
+    treating it as a baseline.
 
     Driven by the hot Allocation/Limited watchlist (terms) so we only chase
     bottles the warehouse feed says are real, rare, and in the state."""
     out: list[BoardStoreStock] = []
     seen: set[str] = set()
+    trusted = True
     for term in terms:
-        for prod in search(session, board, term, timeout=timeout):
+        rows, ok = search_trusted(session, board, term, timeout=timeout)
+        trusted = trusted and ok
+        for prod in rows:
             code = str(prod.get("Code") or "")
             if not code or code in seen:
                 continue
@@ -166,7 +189,7 @@ def fetch_board_stock(session, board: str, terms: list[str], timeout: int = 60) 
             name = prod.get("Brand") or ""
             price = str(prod.get("Retail") or "")
             out.extend(details_to_stock(board, code, name, price, details(session, board, code, timeout=timeout)))
-    return out
+    return out, trusted
 
 
 MAX_RECHECK = 40  # cap targeted sellout re-queries per board per run

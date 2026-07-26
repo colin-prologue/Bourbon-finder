@@ -12,7 +12,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
+import re
 
 from . import alerts as alerts_mod
 from .alerts import alert, send_digest
@@ -20,6 +22,7 @@ from .config import load_config
 from .db import connect, now_iso, record_health
 from .db import prune as db_prune
 from .diff import (
+    alertable_codes,
     apply_board_snapshot,
     apply_catalog_items,
     apply_shipments,
@@ -87,35 +90,88 @@ def cmd_poll_shipments(conn, cfg, session):
                 len(form.board_options))
 
 
-def _watchlist_terms(conn, limit: int = 80) -> list[str]:
-    """Search terms for the board APIs, derived from the live Allocation/Limited
-    warehouse watchlist: first two words of each brand (a good substring filter
-    for the boards' inventory search)."""
-    terms = set()
+def _watchlist_terms(conn, watch) -> list[str]:
+    """Search terms for the board APIs, covering the WHOLE watch universe.
+
+    A board is only ever asked about products we name, so any gap between the
+    universe and these terms is a silent blind spot — the product can be in the
+    watchlist, in the report's universe, and still never collected. Three
+    sources, matching `diff.watch_codes` plus patterns:
+
+      * Allocation/Limited brands in the warehouse right now
+      * products on the state's official allocated list, which carries items not
+        presently flagged in the warehouse
+      * the literal runs of each configured name_pattern — these are regexes,
+        and board endpoints do plain substring search, so the pattern itself
+        cannot be sent verbatim (see `add_pattern`)
+
+    First two words of each name, which is a good substring filter for these
+    search endpoints and collapses variants ("Four Roses Single Barrel OBSK" and
+    "...OESF" share one term).
+
+    There is deliberately NO cap. The old `sorted(terms)[:80]` truncated
+    alphabetically, so the same 15 brands were dropped on every single run —
+    every Weller variant, Wild Turkey, Widow Jane, Willett, Woodford,
+    Yellowstone. Weller is Allocation-flagged and had never once been searched.
+    A cap on an alphabetically sorted list is not sampling, it is a permanent
+    blind spot at the end of the alphabet.
+    """
+    terms: set[str] = set()
+
+    def add(name: str) -> None:
+        name = (name or "").strip()
+        if name:
+            terms.add(" ".join(name.split()[:2]))
+
+    def add_pattern(pattern: str) -> None:
+        """Add the literal runs of a regex, not the regex itself.
+
+        `name_patterns` are regexes matched against product names, but board
+        endpoints do plain substring search. Sending `^(Pappy|Van Winkle)`
+        verbatim searches for the literal text `^(Pappy|Van`, which matches
+        nothing — and `alertable_codes` cannot recover the miss, because it only
+        inspects rows the search returned. The product would be watched and
+        never polled.
+
+        So split on regex metacharacters and keep the alphanumeric runs. For a
+        plain pattern like `Pappy` this is a no-op; for an alternation it yields
+        one usable term per branch. Over-broad terms are harmless — the watch
+        universe filters what alerts — while a missing term is invisible.
+        """
+        for literal in re.split(r"[^\w\s'&.-]+", pattern or ""):
+            literal = literal.strip()
+            if len(literal) >= 3:      # shorter fragments match far too much
+                add(literal)
+
     for r in conn.execute(
         "SELECT DISTINCT brand_name FROM stock_latest "
         "WHERE listing_type IN ('Allocation','Limited')"
-    ).fetchall():
-        name = (r["brand_name"] or "").strip()
-        if name:
-            terms.add(" ".join(name.split()[:2]))
-    return sorted(terms)[:limit]
+    ):
+        add(r["brand_name"])
+    for r in conn.execute("SELECT DISTINCT product FROM allocated_list"):
+        add(r["product"])
+    for pattern in getattr(watch, "name_patterns", []):
+        add_pattern(pattern)
+    return sorted(terms)
 
 
 def cmd_poll_boards(conn, cfg, session):
     """Board leg: poll each ABC/GO board's public per-store inventory API for the
     hot watchlist, emitting board_restock (on-shelf) alerts. Stage B of the
     two-stage model — stage A is poll-stocks (warehouse arrival)."""
-    terms = list(cfg.boards.search_terms) or _watchlist_terms(conn)
+    terms = list(cfg.boards.search_terms) or _watchlist_terms(conn, cfg.watch)
     if not terms:
         log.info("poll-boards: empty watchlist and no configured search_terms; run poll-stocks first")
         return
     all_rows = []
     observed: set[tuple[str, str]] = set()   # (board, code) whose per-store state we know this run
+    complete: set[str] = set()               # boards that fetched cleanly -> may establish a baseline
     for board in cfg.boards.abcgo_boards:
         ok, err = True, ""
         try:
-            board_rows = abcgo.fetch_board_stock(session, board, terms, timeout=cfg.request_timeout)
+            board_rows, trusted = abcgo.fetch_board_stock(
+                session, board, terms, timeout=cfg.request_timeout
+            )
             found = {r.plu for r in board_rows}
             # Re-query codes that were in stock last run but vanished from search
             # (ABC/GO hides sold-out items) so their sellout is detectable — see issue #2.
@@ -132,6 +188,15 @@ def cmd_poll_boards(conn, cfg, session):
             board_rows.extend(recheck_rows)
             all_rows.extend(board_rows)
             observed |= {(board, c) for c in found} | recheck_obs
+            # Only an authoritative read may establish a baseline. A 403 WAF page
+            # parses to an empty search result, and treating that as "this board
+            # stocks nothing" would seed an empty baseline whose recovery reads
+            # as a burst of restocks.
+            if trusted:
+                complete.add(board)
+            else:
+                ok, err = False, f"{board}: untrusted search response (blocked or non-JSON)"
+                log.warning("abcgo board %s returned an untrusted search; not seeding", board)
         except Exception as exc:  # noqa: BLE001
             ok, err = False, f"{board}: {exc}"
             log.warning("abcgo board %s failed: %s", board, exc, exc_info=True)
@@ -143,6 +208,8 @@ def cmd_poll_boards(conn, cfg, session):
         except Exception as exc:  # noqa: BLE001
             ok, err = False, str(exc)
             log.warning("durham board failed: %s", exc, exc_info=True)
+        if ok:
+            complete.add("durham")
         _health(conn, cfg, "durham", ok, err)
     if cfg.boards.greensboro:
         ok, err = True, ""
@@ -151,8 +218,17 @@ def cmd_poll_boards(conn, cfg, session):
         except Exception as exc:  # noqa: BLE001
             ok, err = False, str(exc)
             log.warning("greensboro board failed: %s", exc, exc_info=True)
+        if ok:
+            complete.add("greensboro")
         _health(conn, cfg, "greensboro", ok, err)
-    events = apply_board_snapshot(conn, all_rows, observed=observed)
+    # Fingerprint of what we searched, so the differ can tell "this bottle just
+    # arrived" from "we just started looking for it" — see apply_board_snapshot.
+    coverage = hashlib.sha256("\n".join(sorted(terms)).encode()).hexdigest()[:16]
+    events = apply_board_snapshot(
+        conn, all_rows, observed=observed,
+        alertable=alertable_codes(conn, cfg.watch, all_rows), complete=complete,
+        coverage=coverage,
+    )
     _emit(conn, cfg, events)
     log.info("boards: %d store-rows across %d board(s), %d events",
              len(all_rows), len(cfg.boards.abcgo_boards), len(events))
@@ -162,14 +238,33 @@ def cmd_poll_catalog(conn, cfg, session):
     ok = True
     err = ""
     items = []
-    for fn in (catalog_mod.fetch_special_items, catalog_mod.fetch_new_items):
+    # Only a feed that fetched cleanly may establish its own baseline — a failed
+    # feed must stay unseeded so its backlog is silent when it recovers.
+    complete: set[str] = set()
+    for fn, source in (
+        (catalog_mod.fetch_special_items, "special_items"),
+        (catalog_mod.fetch_new_items, "new_items"),
+    ):
         try:
-            items.extend(fn(session, timeout=cfg.request_timeout))
+            got = fn(session, timeout=cfg.request_timeout)
+            items.extend(got)
+            # An NC ABC error page comes back HTTP 200 and parses to zero rows,
+            # so "no rows" cannot be distinguished from "the feed is broken".
+            # Seeding off that would mark the feed baselined, and its whole
+            # backlog would then read as new on the first healthy poll — the
+            # 4,186-email burst, rebuilt. These feeds are never legitimately
+            # empty, so treat empty as untrustworthy rather than as a baseline.
+            if got:
+                complete.add(source)
+            else:
+                ok = False
+                err = f"{fn.__name__}: returned no rows; not seeding {source}"
+                log.warning(err)
         except Exception as exc:  # noqa: BLE001
             ok = False
             err = f"{fn.__name__}: {exc}"
             log.warning(err)
-    events = apply_catalog_items(conn, items, cfg.watch)
+    events = apply_catalog_items(conn, items, cfg.watch, complete=complete)
     # allocated xlsx: byte-diff then parse
     try:
         content, sha = catalog_mod.fetch_allocated_xlsx(session, timeout=cfg.request_timeout)
@@ -226,7 +321,16 @@ def cmd_poll_wake(conn, cfg, session):
     seen = {}
     for r in all_rows:
         seen[(r.plu, r.store)] = r
-    events = apply_wake_snapshot(conn, list(seen.values()))
+    rows = list(seen.values())
+    # `ok` is False if any search term failed. A partial run must not become the
+    # baseline, or the missing terms' existing stock reads as restocks when they
+    # recover.
+    events = apply_wake_snapshot(
+        conn, rows, alertable=alertable_codes(conn, cfg.watch, rows), complete=ok,
+        coverage=hashlib.sha256(
+            "\n".join(sorted(cfg.wake.search_terms)).encode()
+        ).hexdigest()[:16],
+    )
     _emit(conn, cfg, events)
     log.info("wake: %d store-rows, %d events", len(seen), len(events))
 

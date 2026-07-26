@@ -85,6 +85,21 @@ CREATE TABLE IF NOT EXISTS alert_log (
   message TEXT,
   sent_at TEXT
 );
+-- Which scopes have had a complete first observation. Seeding used to be
+-- INFERRED from the data ("is this table empty?", "does this board have rows?"),
+-- which is wrong in three ways that all end in a burst of false alerts:
+--   * a first poll that legitimately returns nothing never establishes a
+--     baseline, so the next poll's real rows are swallowed as "still seeding";
+--   * catalog rows are deduplicated by nc_code, so a feed whose codes were all
+--     already inserted by another feed leaves no trace of itself;
+--   * a partially-failed run persists what succeeded, which then reads as
+--     "seeded" for the parts that never ran.
+-- Recording it explicitly, and only when a scope was observed COMPLETELY,
+-- removes all three. Scope names: "board:<slug>", "catalog:<feed>", "wake".
+CREATE TABLE IF NOT EXISTS seeded (
+  scope TEXT PRIMARY KEY,
+  first_seen TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS health (
   source TEXT PRIMARY KEY,
   last_ok TEXT,
@@ -276,6 +291,20 @@ def record_health(conn: sqlite3.Connection, source: str, ok: bool, error: str = 
         )
     conn.commit()
     return fails
+
+
+def is_seeded(conn: sqlite3.Connection, scope: str) -> bool:
+    """Has this scope already had a complete first observation?"""
+    return conn.execute("SELECT 1 FROM seeded WHERE scope=?", (scope,)).fetchone() is not None
+
+
+def mark_seeded(conn: sqlite3.Connection, scope: str) -> None:
+    """Record a scope's baseline. Call ONLY when the scope was observed in full —
+    marking a partial observation is what makes the missing half look like news
+    the next time it succeeds."""
+    conn.execute(
+        "INSERT OR IGNORE INTO seeded (scope, first_seen) VALUES (?,?)", (scope, now_iso())
+    )
 
 
 def recently_alerted(conn: sqlite3.Connection, kind: str, key: str, cooldown_hours: float) -> bool:

@@ -19,6 +19,9 @@ class AlertConfig:
     from_addr: str = ""
     to_addrs: list[str] = field(default_factory=list)
     cooldown_hours: float = 6.0  # don't repeat the same alert key within this window
+    # Backstop against a noise regression. Steady state is single digits/day;
+    # if this binds, something upstream broke. 0 disables the cap.
+    max_daily_alerts: int = 25
 
     @property
     def smtp_password(self) -> str:
@@ -89,6 +92,7 @@ def load_config(path: str | None = None) -> Config:
         from_addr=a.get("from_addr", a.get("smtp_user", "")),
         to_addrs=list(a.get("to_addrs", [])),
         cooldown_hours=a.get("cooldown_hours", 6.0),
+        max_daily_alerts=a.get("max_daily_alerts", 25),
     )
     w = data.get("watch", {})
     cfg.watch = WatchConfig(
