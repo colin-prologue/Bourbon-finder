@@ -15,6 +15,8 @@ smtp_user = "colin@prologuegames.com"     # for Gmail use an App Password
 from_addr = "colin@prologuegames.com"
 to_addrs = ["colin@prologuegames.com"]
 cooldown_hours = 6.0                      # suppress duplicate alerts within this window
+# Backstop against a noise regression (health warnings are never capped).
+max_daily_alerts = 25
 
 [watch]
 # Instant alerts fire only for these Listing Types (your chosen scope).

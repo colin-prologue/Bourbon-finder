@@ -20,6 +20,7 @@ from .config import load_config
 from .db import connect, now_iso, record_health
 from .db import prune as db_prune
 from .diff import (
+    alertable_codes,
     apply_board_snapshot,
     apply_catalog_items,
     apply_shipments,
@@ -152,7 +153,9 @@ def cmd_poll_boards(conn, cfg, session):
             ok, err = False, str(exc)
             log.warning("greensboro board failed: %s", exc, exc_info=True)
         _health(conn, cfg, "greensboro", ok, err)
-    events = apply_board_snapshot(conn, all_rows, observed=observed)
+    events = apply_board_snapshot(
+        conn, all_rows, observed=observed, alertable=alertable_codes(conn, cfg.watch, all_rows)
+    )
     _emit(conn, cfg, events)
     log.info("boards: %d store-rows across %d board(s), %d events",
              len(all_rows), len(cfg.boards.abcgo_boards), len(events))
@@ -226,7 +229,8 @@ def cmd_poll_wake(conn, cfg, session):
     seen = {}
     for r in all_rows:
         seen[(r.plu, r.store)] = r
-    events = apply_wake_snapshot(conn, list(seen.values()))
+    rows = list(seen.values())
+    events = apply_wake_snapshot(conn, rows, alertable=alertable_codes(conn, cfg.watch, rows))
     _emit(conn, cfg, events)
     log.info("wake: %d store-rows, %d events", len(seen), len(events))
 

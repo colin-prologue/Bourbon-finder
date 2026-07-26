@@ -38,6 +38,17 @@ def send_email(cfg: AlertConfig, subject: str, body: str) -> bool:
         return False
 
 
+def sent_today(conn: sqlite3.Connection) -> int:
+    """Instant alerts actually delivered in the last 24h. Health warnings and
+    suppression records are excluded — the cap exists to stop product noise,
+    and must never gag the alert that says the scraper is broken."""
+    return conn.execute(
+        "SELECT COUNT(*) FROM alert_log WHERE sent_at > "
+        "strftime('%Y-%m-%dT%H:%M:%SZ','now','-1 day') "
+        "AND kind NOT IN ('health') AND kind NOT LIKE 'capped:%'"
+    ).fetchone()[0]
+
+
 def alert(
     conn: sqlite3.Connection,
     cfg: AlertConfig,
@@ -46,9 +57,21 @@ def alert(
     subject: str,
     body: str,
 ) -> None:
-    """Send an instant alert unless the same (kind, key) fired recently."""
+    """Send an instant alert unless the same (kind, key) fired recently, or the
+    day's budget is spent.
+
+    The cap is a backstop, not a policy: with relevance filtering and
+    per-product aggregation the real volume sits in the low single digits a
+    day. If it ever binds, something upstream has regressed — so the skipped
+    alert is recorded under `capped:<kind>`, which keeps it out of the cooldown
+    for the real (kind, key) and lets the report say how much was dropped.
+    """
     if recently_alerted(conn, kind, key, cfg.cooldown_hours):
         log.info("suppressed duplicate alert %s/%s", kind, key)
+        return
+    if kind != "health" and cfg.max_daily_alerts and sent_today(conn) >= cfg.max_daily_alerts:
+        log.warning("daily alert cap (%d) reached; skipping %s/%s", cfg.max_daily_alerts, kind, key)
+        log_alert(conn, f"capped:{kind}", key, f"[capped] {subject}")
         return
     sent = send_email(cfg, subject, body)
     log_alert(conn, kind, key, f"[{'sent' if sent else 'logged'}] {subject}")

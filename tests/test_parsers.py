@@ -16,6 +16,20 @@ from ncbourbon.sources.wake import parse_wake_results
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
+def zeroed(rows):
+    """A zero-quantity copy of `rows`, for establishing a diff baseline.
+
+    The first observation of a source is silent by design: a scope with no
+    prior state has nothing to diff, so treating every row as new is how one
+    poll-catalog produced 4,186 emails. Tests that exercise 0 -> >0
+    transitions therefore seed the baseline explicitly, the way a second real
+    poll would see it.
+    """
+    from dataclasses import replace
+
+    return [replace(r, qty=0) for r in rows]
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _build_fixtures():
     import subprocess, sys
@@ -66,17 +80,28 @@ def test_stock_diff_events(tmp_path):
     conn = connect(str(tmp_path / "t.db"))
     watch = WatchConfig(listing_types=["Allocation", "Limited"], drawdown_alert_fraction=0.5)
     rows = parse_stock_report((FIXTURES / "stocks_sample.html").read_text())
-    # First snapshot: Blanton's SB (Allocation, 13) should fire stock_new
-    events = apply_stock_snapshot(conn, rows, watch, "2026-07-21")
-    kinds = {(e.kind, e.key) for e in events}
+
+    # The very first snapshot is the baseline, not news — the whole warehouse
+    # would otherwise read as an arrival.
+    assert apply_stock_snapshot(conn, rows, watch, "2026-07-21") == []
+
+    # 27090 sells out, then comes back: that round trip is the real signal.
+    def set_avail(code, n):
+        for r in rows:
+            if r.nc_code == code:
+                r.total_available = n
+
+    set_avail("27090", 0)
+    apply_stock_snapshot(conn, rows, watch, "2026-07-22")
+    set_avail("27090", 13)
+    kinds = {(e.kind, e.key) for e in apply_stock_snapshot(conn, rows, watch, "2026-07-23")}
     assert ("stock_new", "27090") in kinds
     # 'Listed' Wyoming Whiskey must NOT alert
     assert not any(k == "stock_new" and key == "00026" for k, key in kinds)
-    # Second snapshot with drawdown 13 -> 3 (>=50%) fires stock_drawdown
-    for r in rows:
-        if r.nc_code == "27090":
-            r.total_available = 3
-    events2 = apply_stock_snapshot(conn, rows, watch, "2026-07-21")
+
+    # Drawdown 13 -> 3 (>=50%) fires stock_drawdown
+    set_avail("27090", 3)
+    events2 = apply_stock_snapshot(conn, rows, watch, "2026-07-24")
     assert any(e.kind == "stock_drawdown" and e.key == "27090" for e in events2)
 
 
@@ -266,6 +291,110 @@ def test_prune_drops_history_past_the_horizon(tmp_path):
     assert conn.execute("SELECT COUNT(*) FROM board_stock").fetchone()[0] == 1
 
 
+def _board_rows(*specs):
+    from ncbourbon.sources.abcgo import BoardStoreStock
+
+    return [BoardStoreStock("greensboro", plu, name, "$60", store, qty)
+            for plu, name, store, qty in specs]
+
+
+def test_board_alerts_are_limited_to_watched_codes():
+    """Board search matches loosely: a bourbon watchlist pulled back 285
+    Greensboro codes of which 28 were allocated. Everything is stored; only
+    watched codes interrupt anyone."""
+    from ncbourbon.db import connect
+    from ncbourbon.diff import alertable_codes, apply_board_snapshot
+    from ncbourbon.config import WatchConfig
+
+    conn = connect(":memory:")
+    conn.execute("INSERT INTO allocated_list VALUES ('27090','Blantons','','L')")
+    conn.execute(
+        "INSERT INTO stock_latest VALUES ('20595','Stagg Bourbon','Allocation',16,'x')"
+    )
+    conn.commit()
+
+    rows = _board_rows(
+        ("27090", "Blanton's Single Barrel", "s1", 2),        # on the allocated list
+        ("20595", "Stagg Bourbon", "s1", 4),                  # Allocation in warehouse
+        ("17306", "Crystal Head Vodka Camo", "s1", 5),        # collateral from search
+        ("99999", "Pappy Van Winkle 23", "s1", 1),            # matches a name pattern
+    )
+    watch = WatchConfig(listing_types=["Allocation", "Limited"], name_patterns=["Pappy"])
+    apply_board_snapshot(conn, zeroed(rows))                  # baseline, see zeroed()
+    codes = alertable_codes(conn, watch, rows)
+    events = apply_board_snapshot(conn, rows, alertable=codes)
+
+    assert {e.key for e in events} == {
+        "greensboro:27090", "greensboro:20595", "greensboro:99999",
+    }
+    # ...but the vodka is still recorded, because the report and site want the
+    # whole inventory picture.
+    assert conn.execute(
+        "SELECT qty FROM board_latest WHERE plu='17306'"
+    ).fetchone()[0] == 5
+
+
+def test_new_board_seeds_silently():
+    """Adding a board must not mail its entire opening inventory."""
+    from ncbourbon.db import connect
+    from ncbourbon.diff import apply_board_snapshot
+
+    conn = connect(":memory:")
+    rows = _board_rows(("27090", "Blanton's", "s1", 2), ("27090", "Blanton's", "s2", 3))
+    assert apply_board_snapshot(conn, rows) == []
+    # Rows are stored even though nothing was announced.
+    assert conn.execute("SELECT COUNT(*) FROM board_latest").fetchone()[0] == 2
+    # A genuine later restock at a *third* store does fire.
+    events = apply_board_snapshot(conn, rows + _board_rows(("27090", "Blanton's", "s3", 1)))
+    assert [e.key for e in events] == ["greensboro:27090"]
+
+
+def test_first_catalog_load_seeds_silently():
+    """4,186 emails on the first poll-catalog; never again."""
+    from ncbourbon.config import WatchConfig
+    from ncbourbon.db import connect
+    from ncbourbon.diff import apply_catalog_items
+    from ncbourbon.sources.catalog import CatalogItem
+
+    conn = connect(":memory:")
+    items = [
+        CatalogItem(nc_code=str(i), brand_name=f"Bourbon {i}",
+                    retail_price="$40", source="special_items")
+        for i in range(50)
+    ]
+    assert apply_catalog_items(conn, items, WatchConfig()) == []
+    assert conn.execute("SELECT COUNT(*) FROM catalog").fetchone()[0] == 50
+    # A genuinely new code afterwards is news.
+    events = apply_catalog_items(
+        conn,
+        [CatalogItem(nc_code="999", brand_name="Pappy Van Winkle 23",
+                     retail_price="$300", source="special_items")],
+        WatchConfig(),
+    )
+    assert [e.key for e in events] == ["999"]
+
+
+def test_daily_alert_cap_never_gags_health_warnings():
+    from ncbourbon.alerts import alert
+    from ncbourbon.config import AlertConfig
+    from ncbourbon.db import connect
+
+    conn = connect(":memory:")
+    cfg = AlertConfig(max_daily_alerts=3, cooldown_hours=0)   # email disabled -> logged
+    for i in range(6):
+        alert(conn, cfg, "board_restock", f"k{i}", f"subject {i}", "body")
+    sent = conn.execute(
+        "SELECT COUNT(*) FROM alert_log WHERE kind='board_restock'"
+    ).fetchone()[0]
+    capped = conn.execute(
+        "SELECT COUNT(*) FROM alert_log WHERE kind='capped:board_restock'"
+    ).fetchone()[0]
+    assert (sent, capped) == (3, 3)
+    # The scraper-is-broken alert still gets through a spent budget.
+    alert(conn, cfg, "health", "stocks", "source failing", "body")
+    assert conn.execute("SELECT COUNT(*) FROM alert_log WHERE kind='health'").fetchone()[0] == 1
+
+
 def test_board_history_records_changes_not_rereadings(monkeypatch):
     """board_stock is history; re-polling an unchanged shelf must not append.
 
@@ -293,12 +422,13 @@ def test_board_history_records_changes_not_rereadings(monkeypatch):
 def test_wake_diff_restock(tmp_path):
     conn = connect(str(tmp_path / "t.db"))
     rows = parse_wake_results((FIXTURES / "wake_sample.html").read_text())
+    assert apply_wake_snapshot(conn, zeroed(rows)) == []      # baseline, see zeroed()
     events = apply_wake_snapshot(conn, rows)
-    # both in-stock store rows are new -> restock events
-    assert sum(1 for e in events if e.kind == "wake_restock") == 2
+    # Both in-stock stores belong to one product -> one event carrying both.
+    assert [e.kind for e in events] == ["wake_restock"]
+    assert "2 stores" in events[0].subject
     # replay same snapshot -> no new events
-    events2 = apply_wake_snapshot(conn, rows)
-    assert not events2
+    assert apply_wake_snapshot(conn, rows) == []
 
 
 def test_nc_today_timezone():
@@ -645,11 +775,13 @@ def test_greensboro_enrichment_does_not_refire_restock(monkeypatch):
     # Poll 1: pre-enrichment adapter (STORE_NAMES empty) -> id-based labels.
     monkeypatch.setattr(greensboro, "STORE_NAMES", {})
     rows_before = greensboro.items_to_stock(item)
+    apply_board_snapshot(conn, zeroed(rows_before))   # baseline; see zeroed()
     ev1 = apply_board_snapshot(conn, rows_before)
-    assert {e.key for e in ev1} == {                 # only the two >0 stores fire
-        "greensboro:24275:Greensboro store #28",
-        "greensboro:24275:Greensboro store #32",
-    }
+    # One event for the product, not one per store — the two >0 stores ride in
+    # the body.
+    assert {e.key for e in ev1} == {"greensboro:24275"}
+    assert "2 stores" in ev1[0].subject
+    assert "25 @" in ev1[0].body and "10 @" in ev1[0].body
     # Pre-enrichment, display falls back to the stable key.
     assert all(r.store_display.startswith("Greensboro store #") for r in rows_before)
 
