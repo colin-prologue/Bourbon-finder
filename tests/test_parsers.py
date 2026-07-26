@@ -409,6 +409,53 @@ def test_greensboro_items_to_stock():
     assert 0 in by_store.values()              # sold-out store kept -> restock detectable
     assert rows[0].name == "Maker's Mark (BTB) .75L"
     assert rows[0].price == "33.95"
+    # `store` is the STABLE id-based key (part of the board_latest PK); the
+    # human name lives in store_display, sourced from STORE_NAMES.
+    assert set(by_store) == {
+        "Greensboro store #28", "Greensboro store #30", "Greensboro store #32"
+    }
+    display = {r.store: r.store_display for r in rows}
+    assert display["Greensboro store #28"].startswith("Store 12 - Hickory Branch")
+    assert display["Greensboro store #32"].startswith("Store 16 - Fleming Road")
+
+
+def test_greensboro_enrichment_does_not_refire_restock(monkeypatch):
+    """The re-key gotcha: enriching STORE_NAMES must NOT reset a store's diff
+    baseline. Because `store` (the board_latest key) is derived from the
+    immutable internalid — never from STORE_NAMES — a store already seen at
+    qty>0 stays the same key after enrichment, so no spurious board_restock
+    fires. Only store_display changes (id-label -> real name)."""
+    from ncbourbon.db import connect
+    from ncbourbon.diff import apply_board_snapshot
+    from ncbourbon.sources import greensboro
+
+    conn = connect(":memory:")
+    item = _GREENSBORO_ITEMS  # store 28 @ 25 on hand, 30 @ 0, 32 @ 10
+
+    # Poll 1: pre-enrichment adapter (STORE_NAMES empty) -> id-based labels.
+    monkeypatch.setattr(greensboro, "STORE_NAMES", {})
+    rows_before = greensboro.items_to_stock(item)
+    ev1 = apply_board_snapshot(conn, rows_before)
+    assert {e.key for e in ev1} == {                 # only the two >0 stores fire
+        "greensboro:24275:Greensboro store #28",
+        "greensboro:24275:Greensboro store #32",
+    }
+    # Pre-enrichment, display falls back to the stable key.
+    assert all(r.store_display.startswith("Greensboro store #") for r in rows_before)
+
+    # Enrichment lands: STORE_NAMES now maps the ids to real names.
+    monkeypatch.setattr(greensboro, "STORE_NAMES", {
+        28: "Store 12 - Hickory Branch, 500 Hickory Branch, Greensboro",
+        30: "Store 14 - Summerfield, 4548 US Hwy 220, Greensboro",
+        32: "Store 16 - Fleming Road, 2309 Fleming Road, Greensboro",
+    })
+    # Poll 2: SAME on-hand as poll 1. Keys are unchanged, so no restock re-fires.
+    rows_after = greensboro.items_to_stock(item)
+    assert [r.store for r in rows_after] == [r.store for r in rows_before]  # key stable
+    assert apply_board_snapshot(conn, rows_after) == []                    # <-- the gotcha, prevented
+    # ...even though the human label DID change (now shows the real store name).
+    disp = {r.store: r.store_display for r in rows_after}
+    assert disp["Greensboro store #28"].startswith("Store 12 - Hickory Branch")
 
 
 def test_greensboro_fetch_end_to_end(monkeypatch):
