@@ -354,6 +354,7 @@ def apply_board_snapshot(
     alertable: set[str] | None = None,
     complete: set[str] | None = None,
     coverage: str | None = None,
+    covered: dict[str, set[str]] | None = None,
 ) -> list[Event]:
     """Store-level board inventory. Emits one board_restock per (board, code)
     that went 0 -> >0 at one or more stores — confirmation a rare bottle is on
@@ -408,6 +409,20 @@ def apply_board_snapshot(
         b for b in complete
         if coverage is not None and not is_seeded(conn, f"coverage:{b}:{coverage}")
     }
+    # A board-wide fingerprint is the best available answer when coverage is a
+    # *query*: ABC/GO and Greensboro search by term and return only what is in
+    # stock, so a code absent from the results was still covered — searched for
+    # and genuinely not there. Per-code bookkeeping would misread that as "never
+    # looked" and silence every real arrival.
+    #
+    # Durham is the other shape. It decides per code whether to spend a detail
+    # request, so "not fetched" really does mean "not covered", and it can say
+    # exactly which codes it looked at. `covered` carries that: for those boards
+    # a first sighting is an arrival only if we had looked at that code before.
+    # Exact, and immune to the fingerprint's weakness — a fingerprint only sees
+    # the inputs it is built from, so a selection rule that changes on some
+    # other axis (a new priority code, an edited pattern) slips straight past it.
+    per_code = covered or {}
     present = {(r.board, r.plu, r.store) for r in rows}
     restocked: dict[tuple[str, str], list[BoardStoreStock]] = {}
     for r in rows:
@@ -425,9 +440,14 @@ def apply_board_snapshot(
                 (r.board, r.plu, r.name, r.price, r.store, r.qty, ts, old),
             )
         first_sighting = old is None
+        was_covered = (
+            is_seeded(conn, f"covered:{r.board}:{r.plu}")
+            if r.board in per_code
+            else r.board not in widened
+        )
         if (
             r.qty > 0
-            and (old == 0 or (first_sighting and r.board not in widened))
+            and (old == 0 or (first_sighting and was_covered))
             and r.board in seeded
         ):
             restocked.setdefault((r.board, r.plu), []).append(r)
@@ -495,5 +515,11 @@ def apply_board_snapshot(
         mark_seeded(conn, f"board:{board}")
         if coverage is not None:
             mark_seeded(conn, f"coverage:{board}:{coverage}")
+    # Recorded after the diff, so this run's own codes still read as new above.
+    # Not gated on `complete`: having looked at a code is a fact about that
+    # code, true even if a later code in the same run blew up.
+    for board, codes in per_code.items():
+        for code in codes:
+            mark_seeded(conn, f"covered:{board}:{code}")
     conn.commit()
     return events

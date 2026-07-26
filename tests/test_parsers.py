@@ -308,10 +308,10 @@ def test_prune_drops_history_past_the_horizon(tmp_path):
     assert conn.execute("SELECT COUNT(*) FROM board_stock").fetchone()[0] == 1
 
 
-def _board_rows(*specs):
+def _board_rows(*specs, board="greensboro"):
     from ncbourbon.sources.abcgo import BoardStoreStock
 
-    return [BoardStoreStock("greensboro", plu, name, "$60", store, qty)
+    return [BoardStoreStock(board, plu, name, "$60", store, qty)
             for plu, name, store, qty in specs]
 
 
@@ -1763,25 +1763,80 @@ def test_durham_will_not_call_an_unreadable_page_a_sellout(monkeypatch, detail, 
     ).fetchone()[0] == 3, "stale beats fabricated — the known quantity stands"
 
 
-def test_changing_durham_selection_widens_coverage(monkeypatch):
-    """The differ silences first sightings when coverage widened, and derives
-    "did coverage widen" from a fingerprint of the search terms. Durham's rule
-    for which matched codes earn a detail fetch is coverage too — changing it
-    from an arbitrary first-60 to a targeted 127 made six bottles that had sat
-    on those shelves for weeks announce themselves as fresh restocks, without
-    any term changing. The fingerprint has to see that axis."""
-    from ncbourbon.cli import _coverage_fingerprint
-    from ncbourbon.sources import durham
+def test_a_board_that_knows_its_coverage_reports_it_per_code():
+    """Durham chooses which codes to spend a request on, so "not fetched" really
+    does mean "not covered" — unlike ABC/GO, where a code missing from the
+    results was searched for and genuinely absent.
 
-    terms = ["eagle rare", "weller"]
-    before = _coverage_fingerprint(terms)
-    assert before == _coverage_fingerprint(list(reversed(terms))), "term order must not matter"
+    A term fingerprint cannot express that. It only sees the inputs it is built
+    from, so promoting a code into the fetch set on any other axis — a new entry
+    in the watch universe, an edited name pattern — slips past it, and the
+    bottle's first fetched row reads as a fresh arrival. Stating coverage per
+    code removes the guess."""
+    from ncbourbon.db import connect, is_seeded
+    from ncbourbon.diff import apply_board_snapshot
 
-    monkeypatch.setattr(durham, "SELECTION_POLICY", "tiered-v2")
-    assert _coverage_fingerprint(terms) != before, (
-        "a change to which codes get fetched must change the fingerprint, "
-        "or the next run reports newly-covered bottles as arrivals"
+    conn = connect(":memory:")
+    fp = "terms-unchanged"
+
+    # Run 1 establishes the board. Durham looked at 111 only.
+    apply_board_snapshot(conn, _board_rows(("111", "Weller", "s1", 2), board="durham"),
+                         complete={"durham"}, coverage=fp, covered={"durham": {"111"}})
+    assert is_seeded(conn, "covered:durham:111")
+
+    # Run 2: 222 is promoted into the fetch set and turns out to be on a shelf.
+    # Terms never changed, so the fingerprint is identical — the old rule would
+    # have called this an arrival. We had simply never looked at it.
+    events = apply_board_snapshot(
+        conn, _board_rows(("111", "Weller", "s1", 2), ("222", "Sazerac Rye", "s1", 9), board="durham"),
+        complete={"durham"}, coverage=fp, covered={"durham": {"111", "222"}},
     )
+    assert events == []
+    assert conn.execute(                       # still collected, just not announced
+        "SELECT qty FROM board_latest WHERE plu='222'").fetchone()[0] == 9
+
+    # Run 3: 333 is now in the fetch set and we looked at it — nothing there.
+    # It yields no row at all, which is what a Durham page with no store table
+    # looks like. Silence is right: it is not on a shelf.
+    events = apply_board_snapshot(
+        conn, _board_rows(("111", "Weller", "s1", 2), board="durham"),
+        complete={"durham"}, coverage=fp, covered={"durham": {"111", "222", "333"}},
+    )
+    assert events == []
+
+    # Run 4 is the case the whole mechanism exists to still allow. 333 was
+    # covered last run and was genuinely absent; now it is on a shelf. That is a
+    # real arrival and MUST alert — a ledger that silences this is just a mute
+    # button.
+    events = apply_board_snapshot(
+        conn, _board_rows(("111", "Weller", "s1", 2), ("333", "Blanton's", "s1", 1),
+                          board="durham"),
+        complete={"durham"}, coverage=fp, covered={"durham": {"111", "222", "333"}},
+    )
+    assert [e.key for e in events] == ["durham:333"]
+
+
+def test_term_driven_boards_keep_the_fingerprint():
+    """The per-code ledger must NOT be applied to boards whose coverage is a
+    query rather than a list. ABC/GO and Greensboro return only in-stock
+    products, so a code absent from the results was still covered — searched for
+    and not there. Treating absence as "never looked" would silence every real
+    arrival on those boards, permanently."""
+    from ncbourbon.db import connect
+    from ncbourbon.diff import apply_board_snapshot
+
+    conn = connect(":memory:")
+    fp = "terms-v1"
+    apply_board_snapshot(conn, _board_rows(("27090", "Blanton's", "s1", 2)),
+                         complete={"greensboro"}, coverage=fp)
+    # Same terms, and a code that was searched for last run and simply absent.
+    # No `covered` for greensboro, so the fingerprint still decides — and says
+    # this is a genuine arrival.
+    events = apply_board_snapshot(
+        conn, _board_rows(("27090", "Blanton's", "s1", 2), ("19791", "Weller", "s1", 1)),
+        complete={"greensboro"}, coverage=fp,
+    )
+    assert [e.key for e in events] == ["greensboro:19791"]
 
 
 def test_report_shows_a_partial_read_not_just_a_green_light(monkeypatch):

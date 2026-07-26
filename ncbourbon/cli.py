@@ -160,22 +160,6 @@ def _watchlist_terms(conn, watch) -> list[str]:
     return sorted(terms)
 
 
-def _coverage_fingerprint(terms: list[str]) -> str:
-    """Fingerprint of what a run covered, so the differ can tell "this bottle
-    just arrived" from "we just started looking for it" — see
-    apply_board_snapshot.
-
-    Terms are most of the answer, but not all of it: Durham decides which of
-    the matched codes are worth a detail fetch, so a change to that rule widens
-    coverage without touching a single term. Folding its policy in keeps the
-    fingerprint honest about the whole of what was covered. It is shared across
-    boards, so bumping it costs the others one silent poll — and a board whose
-    coverage did not change has no first sightings to silence anyway.
-    """
-    parts = [*sorted(terms), f"durham-selection:{durham.SELECTION_POLICY}"]
-    return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
-
-
 def cmd_poll_boards(conn, cfg, session):
     """Board leg: poll each ABC/GO board's public per-store inventory API for the
     hot watchlist, emitting board_restock (on-shelf) alerts. Stage B of the
@@ -187,6 +171,7 @@ def cmd_poll_boards(conn, cfg, session):
     all_rows = []
     observed: set[tuple[str, str]] = set()   # (board, code) whose per-store state we know this run
     complete: set[str] = set()               # boards that fetched cleanly -> may establish a baseline
+    covered: dict[str, set[str]] = {}        # boards that know their coverage per code, not by term
     for board in cfg.boards.abcgo_boards:
         ok, err = True, ""
         try:
@@ -237,6 +222,10 @@ def cmd_poll_boards(conn, cfg, session):
             )
             all_rows.extend(durham_rows)
             observed |= {("durham", code) for code in coverage.observed}
+            # Durham chooses which codes to look at, so it can state its
+            # coverage exactly rather than leaving the differ to infer it from
+            # a fingerprint of the search terms.
+            covered["durham"] = set(coverage.observed)
             record_coverage(
                 conn, "durham", coverage.fetched, coverage.relevant, coverage.classified
             )
@@ -256,11 +245,13 @@ def cmd_poll_boards(conn, cfg, session):
         if ok:
             complete.add("greensboro")
         _health(conn, cfg, "greensboro", ok, err)
-    coverage = _coverage_fingerprint(terms)
+    # Fingerprint of what we searched, so the differ can tell "this bottle just
+    # arrived" from "we just started looking for it" — see apply_board_snapshot.
+    coverage = hashlib.sha256("\n".join(sorted(terms)).encode()).hexdigest()[:16]
     events = apply_board_snapshot(
         conn, all_rows, observed=observed,
         alertable=alertable_codes(conn, cfg.watch, all_rows), complete=complete,
-        coverage=coverage,
+        coverage=coverage, covered=covered,
     )
     _emit(conn, cfg, events)
     log.info("boards: %d store-rows across %d board(s), %d events",
