@@ -1082,6 +1082,67 @@ def test_report_flags_a_stale_source():
     assert sources["catalog"].last_ok is None and sources["catalog"].stale
 
 
+def test_render_site_writes_a_self_contained_page(tmp_path):
+    """The page must work for a neighbour on a phone with no CDN reachable."""
+    import json
+
+    from ncbourbon.config import Config
+    from ncbourbon.site import render_site
+
+    cfg = Config()
+    cfg.wake.enabled = False
+    out = render_site(_report_fixture_db(), cfg, str(tmp_path / "site"))
+
+    data = json.loads((out / "data.json").read_text())
+    assert [i["nc_code"] for i in data["shelf"]] == ["27090"]
+
+    html = (out / "index.html").read_text()
+    assert (out / ".nojekyll").exists()          # Pages must not run this through Jekyll
+
+    # The report is embedded, so the page works opened straight off disk —
+    # browsers block fetch() from file://, which is exactly what render-site
+    # produces. Verified in a browser with data.json deleted entirely.
+    import re
+    embedded = re.search(
+        r'<script type="application/json" id="report">(.*?)</script>', html, re.S
+    ).group(1)
+    assert json.loads(embedded)["shelf"][0]["nc_code"] == "27090"
+    # "</script>" in a scraped product name would close the block early and drop
+    # the rest into the document as markup, so "<" must never appear raw.
+    assert "<" not in embedded
+    assert "noindex" in html                     # a personal tool, not a public listing
+    # No external fetches: the only network call is for the sibling data file.
+    for reach in ("https://", "http://", "src="):
+        assert reach not in html, f"page reaches outside itself via {reach!r}"
+    assert "data.json" in html
+
+
+def test_page_never_interpolates_feed_values_into_markup():
+    """Product names, prices and store labels are scraped from remote feeds and
+    stored verbatim. Building markup from them — even inside an attribute like
+    aria-label — is stored DOM XSS for every visitor once one feed serves a
+    crafted name. Structure may be markup; feed values go through textContent
+    and dataset.
+
+    Guards the shape rather than the symptom: no `${...}` substitution may
+    appear inside an innerHTML assignment.
+    """
+    import re
+
+    html = (Path("ncbourbon/templates/index.html")).read_text()
+    script = html.split("<script>", 1)[1]
+    offenders = [
+        line.strip()
+        for line in script.splitlines()
+        if "innerHTML" in line and "=" in line and "${" in line
+    ]
+    assert not offenders, f"template literal interpolated into innerHTML: {offenders}"
+
+    # The multi-line assignments must also be free of interpolation.
+    for block in re.findall(r"innerHTML\s*=\s*(.+?);", script, re.S):
+        assert "${" not in block, f"interpolated innerHTML block:\n{block}"
+
+
 def test_board_history_records_changes_not_rereadings(monkeypatch):
     """board_stock is history; re-polling an unchanged shelf must not append.
 

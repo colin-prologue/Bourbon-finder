@@ -6,6 +6,7 @@
   python -m ncbourbon poll-catalog    # daily (Special Items, new items, xlsx)
   python -m ncbourbon poll-wake       # 2-4x/day (Wake ABC store inventory)
   python -m ncbourbon report          # print the current picture (no email)
+  python -m ncbourbon render-site     # write the static site to ./site
   python -m ncbourbon digest          # mail the same report
   python -m ncbourbon status          # print health + watched items
   python -m ncbourbon prune           # daily: trim history, reclaim DB pages
@@ -32,6 +33,7 @@ from .diff import (
 )
 from .http import make_session
 from .report import build_report, render_text
+from .site import render_site
 from .sources import catalog as catalog_mod
 from .sources import abcgo, durham, greensboro, stock_shipped, stocks, wake
 
@@ -440,7 +442,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(prog="ncbourbon")
     p.add_argument("command", choices=[
         "poll-stocks", "poll-shipments", "poll-boards", "poll-catalog", "poll-wake", "digest", "status",
-        "backfill", "history", "prune", "report",
+        "backfill", "history", "prune", "report", "render-site",
     ])
     p.add_argument("arg", nargs="?", default=None, help="NC code (for history)")
     p.add_argument("--config", default=None)
@@ -450,6 +452,7 @@ def main(argv=None):
                    help="prune: keep this many days of warehouse history")
     p.add_argument("--board-days", type=int, default=90,
                    help="prune: keep this many days of board/wake/alert history")
+    p.add_argument("--out", default="site", help="render-site: output directory")
     args = p.parse_args(argv)
     cfg = load_config(args.config)
     conn = connect(cfg.db_path)
@@ -462,6 +465,7 @@ def main(argv=None):
         "poll-wake": lambda: cmd_poll_wake(conn, cfg, session),
         "digest": lambda: send_digest(conn, cfg),
         "report": lambda: print(render_text(build_report(conn, cfg))),
+        "render-site": lambda: log.info("site written to %s", render_site(conn, cfg, args.out)),
         "status": lambda: cmd_status(conn, cfg),
         "backfill": lambda: cmd_backfill(conn, cfg, session, args.days, args.delay),
         "history": lambda: cmd_history(conn, args.arg or ""),

@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>NC allocated bourbon — what's on a shelf</title>
+<style>
+  :root {
+    --bg: #fbfaf8; --fg: #1a1714; --dim: #6b6259; --line: #e3ddd4;
+    --card: #fff; --accent: #8a4b1e; --star: #c8811f; --warn: #9b2c2c;
+    --chip: #f0ebe3;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16130f; --fg: #ece5da; --dim: #988d80; --line: #2f2921;
+      --card: #1e1a15; --accent: #d9925a; --star: #e0a63c; --warn: #e08585;
+      --chip: #262019;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 20px 16px 64px; }
+  h1 { font-size: 1.35rem; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .sub { color: var(--dim); font-size: .85rem; margin: 0 0 18px; }
+  .sub a { color: var(--accent); }
+
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 16px; }
+  input[type=search], button {
+    font: inherit; color: inherit; background: var(--card);
+    border: 1px solid var(--line); border-radius: 8px; padding: 7px 11px;
+  }
+  input[type=search] { flex: 1 1 190px; min-width: 0; }
+  button { cursor: pointer; }
+  button[aria-pressed=true] { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 18px; }
+  .chip {
+    font-size: .72rem; padding: 3px 8px; border-radius: 999px;
+    background: var(--chip); color: var(--dim); white-space: nowrap;
+  }
+  .chip.stale { color: var(--warn); font-weight: 600; }
+
+  .item {
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 12px 14px; margin-bottom: 10px;
+  }
+  .item > header { display: flex; gap: 10px; align-items: baseline; }
+  .name { font-weight: 600; flex: 1; }
+  .meta { color: var(--dim); font-size: .8rem; }
+  .star {
+    border: 0; background: none; padding: 0 2px; font-size: 1.15rem; line-height: 1;
+    color: var(--line); cursor: pointer;
+  }
+  .star[aria-pressed=true] { color: var(--star); }
+  .stores { margin: 9px 0 0; padding: 0; list-style: none; font-size: .87rem; }
+  .stores li { display: flex; gap: 9px; padding: 2px 0; color: var(--dim); }
+  .qty { font-variant-numeric: tabular-nums; font-weight: 600; color: var(--fg); min-width: 2.2em; text-align: right; }
+  .board { text-transform: uppercase; font-size: .68rem; letter-spacing: .04em; align-self: center; }
+
+  h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .06em;
+       color: var(--dim); margin: 30px 0 10px; font-weight: 600; }
+  .empty { color: var(--dim); padding: 22px 0; }
+  .note { color: var(--dim); font-size: .78rem; border-top: 1px solid var(--line);
+          margin-top: 34px; padding-top: 14px; }
+  table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+  .scroll { overflow-x: auto; }
+  td, th { text-align: left; padding: 4px 10px 4px 0; white-space: nowrap; }
+  th { color: var(--dim); font-weight: 600; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .down { color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>What's on a shelf</h1>
+  <p class="sub" id="asof">Loading…</p>
+
+  <div class="bar">
+    <input type="search" id="q" placeholder="Filter by name or store…" autocomplete="off">
+    <button id="starred" aria-pressed="false">★ Starred only</button>
+    <button id="share">Copy my list link</button>
+  </div>
+  <div class="chips" id="sources"></div>
+
+  <div id="shelf"></div>
+
+  <h2>Changed recently</h2>
+  <div id="changes"></div>
+
+  <h2>In the state warehouse</h2>
+  <div class="scroll"><table id="warehouse"></table></div>
+
+  <p class="note">
+    Public inventory published by NC ABC and the individual county boards, polled
+    a few times a day and shown here as-is. Local boards refresh their own numbers
+    only a couple of times a day, so treat every quantity as a picture rather than
+    a live feed — a bottle listed here may have left the shelf hours ago, and
+    allocated bottles can be pre-claimed by mixed-beverage accounts.
+    This is a personal hobby tool. It is not affiliated with, endorsed by, or
+    operated by NC ABC or any county board.
+    Your starred list is stored in this browser only; nothing is sent anywhere.
+  </p>
+</div>
+
+<script type="application/json" id="report">null</script>
+<script>
+const $ = s => document.querySelector(s);
+const KEY = "ncbourbon.watch";
+
+let DATA = null;
+let watch = new Set();
+let starredOnly = false;
+let ownHashWrite = false;   // set when we write the fragment ourselves
+
+// A shared link carries the selection in the fragment, so handing a neighbour a
+// pre-filled list needs no account and no server.
+function importHash() {
+  const w = new URLSearchParams(location.hash.slice(1)).get("w");
+  if (w === null) return false;
+  watch = new Set(w.split(",").filter(Boolean));
+  save();
+  // Consume the fragment. Leaving it in the URL made the shared list sticky in
+  // the worst way: a recipient who then starred something saved it to
+  // localStorage, and the next reload re-imported the original fragment and
+  // silently threw their edit away. A shared link is a starting point, not a
+  // permanent override.
+  try {
+    history.replaceState(null, "", location.pathname + location.search);
+  } catch {
+    location.hash = "";   // file:// or a browser that refuses replaceState
+  }
+  return true;
+}
+
+if (!importHash()) {
+  try { watch = new Set(JSON.parse(localStorage.getItem(KEY) || "[]")); } catch { /* first visit */ }
+}
+
+// Following a shared link while the page is already open is a fragment change,
+// not a load — without this the link looks broken to whoever was sent it.
+addEventListener("hashchange", () => {
+  // The clipboard fallback writes the fragment itself so the user can copy it
+  // out of the URL bar. Importing and then clearing our own write would erase
+  // the thing we just put there for them to read.
+  if (ownHashWrite) { ownHashWrite = false; return; }
+  if (importHash() && DATA) renderShelf();
+});
+
+function save() {
+  try { localStorage.setItem(KEY, JSON.stringify([...watch])); } catch { /* private mode */ }
+}
+
+function ago(iso) {
+  if (!iso) return "never";
+  const h = (Date.now() - Date.parse(iso)) / 36e5;
+  if (h < 1) return Math.max(1, Math.round(h * 60)) + "m ago";
+  if (h < 48) return Math.round(h) + "h ago";
+  return Math.round(h / 24) + "d ago";
+}
+
+function empty(message) {
+  const p = document.createElement("p");
+  p.className = "empty";
+  p.textContent = message;
+  return p;
+}
+
+// One row of "qty · board · label". Built through the DOM so no scraped value
+// is ever parsed as markup.
+function storeRow(qty, board, label) {
+  const li = document.createElement("li");
+  const q = document.createElement("span");
+  q.className = "qty";
+  q.textContent = qty;
+  const b = document.createElement("span");
+  b.className = "board";
+  b.textContent = board;
+  const l = document.createElement("span");
+  l.textContent = label;
+  li.append(q, b, l);
+  return li;
+}
+
+function matches(item, q) {
+  if (starredOnly && !watch.has(item.nc_code)) return false;
+  if (!q) return true;
+  const hay = (item.name + " " + item.nc_code + " " +
+               item.stores.map(s => s.label + " " + s.board).join(" ")).toLowerCase();
+  return hay.includes(q);
+}
+
+function renderShelf() {
+  const q = $("#q").value.trim().toLowerCase();
+  const items = DATA.shelf.filter(i => matches(i, q));
+  const host = $("#shelf");
+  host.innerHTML = "";
+  if (!items.length) {
+    host.appendChild(empty(
+      DATA.shelf.length ? "Nothing matches that filter."
+                        : "Nothing from the watchlist is on a shelf right now."
+    ));
+    return;
+  }
+  for (const item of items) {
+    const el = document.createElement("article");
+    el.className = "item";
+    const plural = item.stores.length === 1 ? "store" : "stores";
+    // Product names, prices and store labels are scraped from remote feeds and
+    // stored verbatim. Interpolating them into innerHTML — even inside an
+    // attribute like aria-label — lets a crafted name escape and become live
+    // DOM for every visitor. Structure is markup; feed values go through
+    // textContent and dataset, never through a template string.
+    el.innerHTML =
+      '<header><button class="star">★</button><span class="name"></span>' +
+      '<span class="meta count"></span></header>' +
+      '<div class="meta ident"></div><ul class="stores"></ul>';
+
+    const star = el.querySelector(".star");
+    star.setAttribute("aria-pressed", String(watch.has(item.nc_code)));
+    star.setAttribute("aria-label", "Watch " + item.name);
+    star.dataset.code = item.nc_code;
+
+    el.querySelector(".name").textContent = item.name;
+    el.querySelector(".count").textContent =
+      `${item.total} across ${item.stores.length} ${plural}`;
+    el.querySelector(".ident").textContent =
+      `NC ${item.nc_code}` + (item.price ? " · " + item.price : "") +
+      (item.allocated ? " · allocated list" : "");
+
+    const ul = el.querySelector(".stores");
+    for (const s of [...item.stores].sort((a, b) => b.qty - a.qty)) {
+      ul.appendChild(storeRow(s.qty, s.board, s.label));
+    }
+    host.appendChild(el);
+  }
+  host.querySelectorAll(".star").forEach(b => b.addEventListener("click", () => {
+    const code = b.dataset.code;
+    watch.has(code) ? watch.delete(code) : watch.add(code);
+    save();
+    renderShelf();
+  }));
+}
+
+function renderChanges() {
+  const host = $("#changes");
+  const seen = new Set();
+  const rows = DATA.changes.filter(c => {
+    const k = c.kind + c.nc_code + c.board + c.label;
+    return seen.has(k) ? false : seen.add(k);
+  }).slice(0, 30);
+  if (!rows.length) {
+    host.innerHTML = "";
+    host.appendChild(empty(`Nothing moved in the last ${DATA.window_hours} hours.`));
+    return;
+  }
+  const ul = document.createElement("ul");
+  ul.className = "stores";
+  for (const c of rows) {
+    ul.appendChild(storeRow(
+      c.kind === "on_shelf" ? "+" + c.qty : "—",
+      c.board,
+      `${c.name} · ${c.label} · ${ago(c.at)}`,
+    ));
+  }
+  host.innerHTML = "";
+  host.appendChild(ul);
+}
+
+function renderWarehouse() {
+  const t = $("#warehouse");
+  t.innerHTML = "<tr><th>Cases</th><th>7d</th><th>Product</th><th>Type</th></tr>";
+  for (const w of DATA.warehouse) {
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      '<td class="num cases"></td><td class="num move"></td>' +
+      '<td class="prod"></td><td class="meta type"></td>';
+    tr.querySelector(".cases").textContent = w.cases;
+    if (w.delta) {
+      const span = document.createElement("span");
+      if (w.delta < 0) span.className = "down";
+      span.textContent = (w.delta > 0 ? "+" : "") + w.delta;
+      tr.querySelector(".move").appendChild(span);
+    }
+    tr.querySelector(".prod").textContent = w.name;
+    tr.querySelector(".type").textContent = w.listing_type;
+    t.appendChild(tr);
+  }
+}
+
+function renderSources() {
+  const host = $("#sources");
+  host.innerHTML = "";
+  for (const s of DATA.sources) {
+    const chip = document.createElement("span");
+    chip.className = "chip" + (s.stale ? " stale" : "");
+    chip.textContent = `${s.source} · ${ago(s.last_ok)}` +
+      (s.failures ? ` · ${s.failures} failures` : "");
+    host.appendChild(chip);
+  }
+}
+
+function draw(d) {
+  DATA = d;
+  $("#asof").textContent =
+    `Updated ${ago(d.generated_at)}. Boards refresh a couple of times a day — ` +
+    `this is a picture, not a live feed.`;
+  renderSources();
+  renderShelf();
+  renderChanges();
+  renderWarehouse();
+}
+
+// The report is baked into the page at render time, so opening index.html
+// straight off disk works — browsers block fetch() from a file:// origin, and
+// that is exactly what `render-site` hands you. Over http the sibling
+// data.json is then re-fetched for a fresher copy; failing that is harmless
+// because the embedded copy is already on screen.
+let embedded = null;
+try { embedded = JSON.parse(document.getElementById("report").textContent); } catch {}
+if (embedded) draw(embedded);
+else $("#asof").textContent = "Loading…";
+
+fetch("data.json", { cache: "no-store" })
+  .then(r => r.json())
+  .then(draw)
+  .catch(() => {
+    if (!embedded) $("#asof").textContent = "Could not load data.json.";
+  });
+
+$("#q").addEventListener("input", renderShelf);
+$("#starred").addEventListener("click", e => {
+  starredOnly = !starredOnly;
+  e.currentTarget.setAttribute("aria-pressed", String(starredOnly));
+  renderShelf();
+});
+$("#share").addEventListener("click", async e => {
+  const url = location.origin + location.pathname + "#w=" + [...watch].join(",");
+  try { await navigator.clipboard.writeText(url); e.currentTarget.textContent = "Copied"; }
+  catch {
+    ownHashWrite = true;   // see the hashchange handler
+    location.hash = "w=" + [...watch].join(",");
+    e.currentTarget.textContent = "In the URL bar";
+  }
+  setTimeout(() => { e.currentTarget.textContent = "Copy my list link"; }, 2000);
+});
+</script>
+</body>
+</html>

@@ -3,3 +3,7 @@ __pycache__/
 .pytest_cache/
 _to_delete/
 tests/fixtures/_build/
+
+# Rendered site output (`ncbourbon render-site`). Generated from the DB on every
+# poll and deployed from the workflow, so it is never committed.
+site/
