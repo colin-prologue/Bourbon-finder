@@ -77,12 +77,30 @@ instead.** Three surfaces over one data model:
 
 - **The board (pull, primary).** A page that is always current to the last
   poll. Anyone with the link can open it — no account, no install. Each
-  person picks their own products and stores; that selection lives in their
+  person stars the *products* they care about; that selection lives in their
   browser. This is where "on demand" lives: you look when you want to know.
 - **The daily report (push, once a day).** One email per subscriber, scoped
-  to their picks, aggregated by product.
+  to their brands and their **whole boards**, aggregated by product.
 - **Urgent (push, rare).** Only for exact watchlist matches, one email per
-  product with every store listed, with a hard daily cap.
+  product **per board**, with every affected store in that board listed, and a
+  hard daily cap.
+
+Two points of precision, because both were misread on review:
+
+**Scoping is by product and whole board, never by individual store.** There is
+no store-level preference anywhere — not in the subscriber record, and not in
+the browser either, where starring applies to products. The store-first view on
+the site is a way of *arranging* what is shown, not a filter. If someone
+eventually wants "only the two Durham stores near me," that needs stable store
+identifiers in the subscriber record and does not exist yet.
+
+**Per board, not globally per product.** Aggregating urgent alerts across
+boards sounds tidier and is wrong: the alert key is also the cooldown key, so a
+single global key would mean Blanton's landing in Durham at 10am silences the
+Greensboro alert at 3pm. That is a different county and a different drive —
+genuinely new information, not a duplicate. One email per product per board
+keeps the cooldowns independent, and the per-store fan-out that actually caused
+the noise is still collapsed.
 
 Non-goals, deliberately: no accounts, no login, no server-side user records,
 no database of neighbors, no real-time promise.
