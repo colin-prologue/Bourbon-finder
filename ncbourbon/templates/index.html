@@ -114,6 +114,7 @@ const KEY = "ncbourbon.watch";
 let DATA = null;
 let watch = new Set();
 let starredOnly = false;
+let ownHashWrite = false;   // set when we write the fragment ourselves
 
 // A shared link carries the selection in the fragment, so handing a neighbour a
 // pre-filled list needs no account and no server.
@@ -122,6 +123,16 @@ function importHash() {
   if (w === null) return false;
   watch = new Set(w.split(",").filter(Boolean));
   save();
+  // Consume the fragment. Leaving it in the URL made the shared list sticky in
+  // the worst way: a recipient who then starred something saved it to
+  // localStorage, and the next reload re-imported the original fragment and
+  // silently threw their edit away. A shared link is a starting point, not a
+  // permanent override.
+  try {
+    history.replaceState(null, "", location.pathname + location.search);
+  } catch {
+    location.hash = "";   // file:// or a browser that refuses replaceState
+  }
   return true;
 }
 
@@ -131,7 +142,13 @@ if (!importHash()) {
 
 // Following a shared link while the page is already open is a fragment change,
 // not a load — without this the link looks broken to whoever was sent it.
-addEventListener("hashchange", () => { if (importHash() && DATA) renderShelf(); });
+addEventListener("hashchange", () => {
+  // The clipboard fallback writes the fragment itself so the user can copy it
+  // out of the URL bar. Importing and then clearing our own write would erase
+  // the thing we just put there for them to read.
+  if (ownHashWrite) { ownHashWrite = false; return; }
+  if (importHash() && DATA) renderShelf();
+});
 
 function save() {
   try { localStorage.setItem(KEY, JSON.stringify([...watch])); } catch { /* private mode */ }
@@ -323,7 +340,11 @@ $("#starred").addEventListener("click", e => {
 $("#share").addEventListener("click", async e => {
   const url = location.origin + location.pathname + "#w=" + [...watch].join(",");
   try { await navigator.clipboard.writeText(url); e.currentTarget.textContent = "Copied"; }
-  catch { location.hash = "w=" + [...watch].join(","); e.currentTarget.textContent = "In the URL bar"; }
+  catch {
+    ownHashWrite = true;   // see the hashchange handler
+    location.hash = "w=" + [...watch].join(",");
+    e.currentTarget.textContent = "In the URL bar";
+  }
   setTimeout(() => { e.currentTarget.textContent = "Copy my list link"; }, 2000);
 });
 </script>
