@@ -892,6 +892,65 @@ def test_abcgo_implicit_sellout_shows_as_a_change(monkeypatch):
     assert [c.kind for c in report.changes] == ["off_shelf", "on_shelf"]
 
 
+def test_report_does_not_call_a_sale_an_appearance(monkeypatch):
+    """History records every quantity change, sales included. Classifying on
+    `qty > 0` alone made 4 -> 2 an appearance, so one restock plus two sales
+    printed as "3 appeared" — the per-store fan-out this tool exists to remove,
+    rebuilt one layer up. Only crossings of the zero line count.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from ncbourbon import diff as diff_mod
+    from ncbourbon.config import Config
+    from ncbourbon.db import connect
+    from ncbourbon.diff import apply_board_snapshot
+    from ncbourbon.report import build_report
+    from ncbourbon.sources.abcgo import BoardStoreStock
+
+    base = datetime.now(timezone.utc) - timedelta(hours=5)
+    clock = iter(
+        (base + timedelta(minutes=m)).strftime("%Y-%m-%dT%H:%M:%SZ") for m in range(0, 180, 12)
+    )
+    monkeypatch.setattr(diff_mod, "now_iso", lambda: next(clock))
+
+    conn = connect(":memory:")
+    conn.execute("INSERT INTO allocated_list VALUES ('27090','Blantons','','L')")
+    conn.commit()
+    cfg = Config()
+    cfg.wake.enabled = False
+
+    # baseline, arrival, sale, sale, sells out, comes back
+    for qty in (0, 4, 2, 1, 0, 3):
+        apply_board_snapshot(
+            conn, [BoardStoreStock("greensboro", "27090", "B", "$65", "s1", qty)],
+            complete={"greensboro"},
+        )
+
+    kinds = [c.kind for c in build_report(conn, cfg).changes]
+    assert kinds.count("on_shelf") == 2      # 0->4 and 0->3, NOT the two sales
+    assert kinds.count("off_shelf") == 1     # 1->0
+
+
+def test_abcgo_sellout_records_the_quantity_it_fell_from():
+    """The recheck path is the only way an ABC/GO board clears a shelf. Writing
+    that row without prev_qty would leave the clearance unclassifiable, so the
+    report could not show it as gone."""
+    from ncbourbon.db import connect
+    from ncbourbon.diff import apply_board_snapshot
+    from ncbourbon.sources.abcgo import BoardStoreStock
+
+    conn = connect(":memory:")
+    rows = [BoardStoreStock("nh", "27090", "B", "$65", "s1", 4)]
+    apply_board_snapshot(conn, rows, complete={"nh"})          # seeds
+    apply_board_snapshot(conn, rows, complete={"nh"})          # 0 -> 4 recorded? no change
+    apply_board_snapshot(conn, [], observed={("nh", "27090")}, complete={"nh"})
+
+    row = conn.execute(
+        "SELECT prev_qty, qty FROM board_stock WHERE qty=0 AND board='nh'"
+    ).fetchone()
+    assert (row["prev_qty"], row["qty"]) == (4, 0)
+
+
 def test_report_flags_a_stale_source():
     from ncbourbon.config import Config
     from ncbourbon.db import record_health

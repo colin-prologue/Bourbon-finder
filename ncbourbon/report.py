@@ -251,16 +251,37 @@ def _changes(conn: sqlite3.Connection, codes: set[str], boards: set[str], hours:
         for r in conn.execute("SELECT DISTINCT board, store, store_display FROM board_latest")
     }
     out = []
+
+    def classify(prev, qty) -> str | None:
+        """Which kind of change this row is, or None if it is not one.
+
+        History records every quantity change, which includes ordinary sales.
+        Classifying on `qty > 0` alone called a 4 -> 2 sale an appearance, so a
+        single restock followed by two sales printed as "3 appeared" — the
+        per-store fan-out this tool exists to remove, rebuilt one layer up.
+        Only a crossing of the zero line is an appearance or a clearance;
+        movement between two positive quantities is neither.
+        """
+        qty = qty or 0
+        if qty > 0 and not prev:        # prev 0 or NULL -> crossed up
+            return "on_shelf"
+        if qty == 0 and prev:           # crossed down
+            return "off_shelf"
+        return None
+
     for r in conn.execute(
-        "SELECT board, plu, name, store, qty, observed_at FROM board_stock "
+        "SELECT board, plu, name, store, qty, prev_qty, observed_at FROM board_stock "
         "WHERE observed_at > ? ORDER BY observed_at DESC",
         (since,),
     ):
         if r["plu"] not in codes or r["board"] not in boards:
             continue
+        kind = classify(r["prev_qty"], r["qty"])
+        if kind is None:
+            continue
         out.append(
             Change(
-                kind="on_shelf" if (r["qty"] or 0) > 0 else "off_shelf",
+                kind=kind,
                 nc_code=r["plu"],
                 name=r["name"] or r["plu"],
                 board=r["board"],
@@ -274,15 +295,18 @@ def _changes(conn: sqlite3.Connection, codes: set[str], boards: set[str], hours:
     # Wake movement from the report.
     if "wake" in boards:
         for r in conn.execute(
-            "SELECT plu, name, store, qty, observed_at FROM wake_stock "
+            "SELECT plu, name, store, qty, prev_qty, observed_at FROM wake_stock "
             "WHERE observed_at > ? AND store != '__ALL__' ORDER BY observed_at DESC",
             (since,),
         ):
             if r["plu"] not in codes:
                 continue
+            kind = classify(r["prev_qty"], r["qty"])
+            if kind is None:
+                continue
             out.append(
                 Change(
-                    kind="on_shelf" if (r["qty"] or 0) > 0 else "off_shelf",
+                    kind=kind,
                     nc_code=r["plu"],
                     name=r["name"] or r["plu"],
                     board="wake",

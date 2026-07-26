@@ -463,10 +463,11 @@ def apply_board_snapshot(
                     (board, plu, store),
                 ).fetchone()
                 conn.execute(
-                    "INSERT OR IGNORE INTO board_stock (board, plu, name, price, store, qty, observed_at) "
-                    "VALUES (?,?,?,?,?,0,?)",
+                    "INSERT OR IGNORE INTO board_stock "
+                    "(board, plu, name, price, store, qty, observed_at, prev_qty) "
+                    "VALUES (?,?,?,?,?,0,?,?)",
                     (board, plu, meta["name"] if meta else "", meta["price"] if meta else "",
-                     store, ts),
+                     store, ts, oldqty),
                 )
     for (board, plu), hits in sorted(restocked.items()):
         if alertable is not None and plu not in alertable:
