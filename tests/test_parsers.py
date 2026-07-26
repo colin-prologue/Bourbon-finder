@@ -1,6 +1,7 @@
 """Parser tests against fixtures reconstructed from live DOM captures
 (2026-07-21). Run: python -m pytest tests/ -v
 """
+import pathlib
 import re
 from pathlib import Path
 
@@ -14,6 +15,14 @@ from ncbourbon.sources.stocks import SchemaDriftError, parse_stock_report
 from ncbourbon.sources.wake import parse_wake_results
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def _tmp_legacy_path():
+    """A throwaway on-disk DB path. The migration test needs a real file so the
+    connection can be closed and reopened, which is what triggers _migrate."""
+    import tempfile, uuid
+
+    return pathlib.Path(tempfile.gettempdir()) / f"ncb-legacy-{uuid.uuid4().hex}.db"
 
 
 def zeroed(rows):
@@ -929,6 +938,93 @@ def test_report_does_not_call_a_sale_an_appearance(monkeypatch):
     kinds = [c.kind for c in build_report(conn, cfg).changes]
     assert kinds.count("on_shelf") == 2      # 0->4 and 0->3, NOT the two sales
     assert kinds.count("off_shelf") == 1     # 1->0
+
+
+def test_migrated_legacy_history_is_not_reported_as_arrivals():
+    """The prev_qty migration cannot leave legacy rows NULL: the report reads a
+    NULL prev on a positive row as a crossing up from zero, so every in-stock
+    legacy row inside the window would be announced as newly appeared in the
+    first digest after deploying."""
+    import sqlite3
+
+    from ncbourbon.config import Config
+    from ncbourbon.db import connect, now_iso
+    from ncbourbon.report import build_report
+
+    # Build a full, current DB, then push board_stock back to its pre-migration
+    # shape so the migration has something real to upgrade.
+    path = str(_tmp_legacy_path())
+    conn = connect(path)
+    conn.execute("INSERT INTO allocated_list VALUES ('27090','Blantons','','L')")
+    conn.executescript(
+        """
+        DROP TABLE board_stock;
+        CREATE TABLE board_stock (
+          board TEXT NOT NULL, plu TEXT NOT NULL, name TEXT, price TEXT,
+          store TEXT NOT NULL, qty INTEGER, observed_at TEXT NOT NULL,
+          PRIMARY KEY (board, plu, store, observed_at)
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO board_stock VALUES ('greensboro','27090','B','$65','s1',6,?)",
+        (now_iso(),),
+    )
+    conn.commit()
+    conn.close()
+
+    conn = connect(path)      # runs _migrate
+    assert conn.execute("SELECT prev_qty FROM board_stock").fetchone()[0] == 6  # == qty
+
+    cfg = Config()
+    cfg.wake.enabled = False
+    assert build_report(conn, cfg).changes == []   # legacy row is not "news"
+
+
+def test_warehouse_section_covers_the_whole_watch_universe():
+    """A Pappy-style bottle the state files as `Listed` can alert and show in
+    shelf changes; filtering the warehouse section by listing_type alone left it
+    out, so the three sections disagreed about what was watched."""
+    from ncbourbon.config import Config
+    from ncbourbon.db import connect
+    from ncbourbon.report import build_report
+
+    conn = connect(":memory:")
+    conn.execute(
+        "INSERT INTO stock_latest VALUES ('99999','Pappy Van Winkle 23','Listed',7,'x')"
+    )
+    conn.execute("INSERT INTO stock_latest VALUES ('20595','Stagg','Allocation',16,'x')")
+    conn.execute("INSERT INTO stock_latest VALUES ('00026','Wyoming Whiskey','Listed',9,'x')")
+    conn.commit()
+
+    cfg = Config()
+    cfg.wake.enabled = False
+    cfg.watch.name_patterns = ["Pappy"]
+    codes = {w.nc_code for w in build_report(conn, cfg).warehouse}
+    assert "99999" in codes      # watched only by pattern, listing_type=Listed
+    assert "20595" in codes      # Allocation
+    assert "00026" not in codes  # Listed and unwatched
+
+
+def test_warehouse_increases_are_not_labelled_as_boards_ordering():
+    """A rising count is replenishment, not cases leaving for boards. Filing
+    both under one heading gave the opposite operational signal for half."""
+    from ncbourbon.report import Report, WarehouseItem, render_text
+
+    report = Report(
+        generated_at="2026-07-26T00:00:00Z", window_hours=24, shelf=[], changes=[],
+        sources=[], suppressed=0,
+        warehouse=[
+            WarehouseItem("1", "Falling Bourbon", "Allocation", 5, -20, "2026-07-26"),
+            WarehouseItem("2", "Rising Bourbon", "Allocation", 90, +30, "2026-07-26"),
+        ],
+    )
+    text = render_text(report)
+    fall = text.index("Falling Bourbon")
+    rise = text.index("Rising Bourbon")
+    order = text.index("drawing down (boards ordering)")
+    repl = text.index("warehouse replenished")
+    assert order < fall < repl < rise    # each sits under the right heading
 
 
 def test_abcgo_sellout_records_the_quantity_it_fell_from():

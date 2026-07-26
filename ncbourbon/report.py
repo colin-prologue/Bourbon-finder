@@ -195,21 +195,25 @@ def _shelf(conn: sqlite3.Connection, codes: set[str], boards: set[str]) -> list[
     return sorted(items.values(), key=lambda i: (not i.allocated, i.name))
 
 
-def _warehouse(conn: sqlite3.Connection, watch, days: int = 7) -> list[WarehouseItem]:
+def _warehouse(
+    conn: sqlite3.Connection, watch, codes: set[str], days: int = 7
+) -> list[WarehouseItem]:
     """The radar: what the state is holding, and which way it is moving.
 
     A falling count means boards are ordering, which is the only forward-looking
     signal left since the warehouse->board shipment feed was retired.
+
+    Built from the same resolved watch universe as `shelf` and `changes`, not
+    from listing_type alone. A Pappy-style bottle the state files as `Listed`
+    can alert and appear in shelf changes, and filtering this section by
+    listing type would have left it out of the warehouse view — the three
+    sections would disagree about what is being watched.
     """
-    if not watch.listing_types:
-        return []
-    placeholders = ",".join("?" * len(watch.listing_types))
     rows = conn.execute(
-        f"SELECT nc_code, brand_name, listing_type, total_available FROM stock_latest "
-        f"WHERE listing_type IN ({placeholders}) AND total_available > 0 "
-        f"ORDER BY listing_type, brand_name",
-        watch.listing_types,
+        "SELECT nc_code, brand_name, listing_type, total_available FROM stock_latest "
+        "WHERE total_available > 0 ORDER BY listing_type, brand_name"
     ).fetchall()
+    rows = [r for r in rows if r["nc_code"] in codes]
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
     out = []
     for r in rows:
@@ -369,7 +373,7 @@ def build_report(conn: sqlite3.Connection, cfg: Config, window_hours: int = 24) 
         generated_at=now_iso(),
         window_hours=window_hours,
         shelf=_shelf(conn, codes, boards),
-        warehouse=_warehouse(conn, cfg.watch),
+        warehouse=_warehouse(conn, cfg.watch, codes),
         changes=_changes(conn, codes, boards, window_hours),
         sources=_sources(conn, boards),
         suppressed=suppressed,
@@ -406,11 +410,19 @@ def render_text(report: Report) -> str:
         lines.append(f"  - {c.name} — gone from [{c.board}] {c.label}")
     lines.append("")
 
-    movers = [w for w in report.warehouse if w.delta]
-    lines.append(f"STATE WAREHOUSE ({len(report.warehouse)} allocation/limited items in stock)")
-    if movers:
-        lines.append("  moving (boards ordering):")
-        for w in sorted(movers, key=lambda w: w.delta or 0)[:15]:
+    # A falling count means cases left for local boards; a rising one means the
+    # warehouse was replenished. Filing both under "boards ordering" gave the
+    # opposite operational signal for half of them, so they are labelled apart.
+    drawdowns = [w for w in report.warehouse if (w.delta or 0) < 0]
+    restocks = [w for w in report.warehouse if (w.delta or 0) > 0]
+    lines.append(f"STATE WAREHOUSE ({len(report.warehouse)} watched items in stock)")
+    if drawdowns:
+        lines.append("  drawing down (boards ordering):")
+        for w in sorted(drawdowns, key=lambda w: w.delta or 0)[:15]:
+            lines.append(f"    {w.delta:+6d}  {w.name} — now {w.cases} cases")
+    if restocks:
+        lines.append("  warehouse replenished:")
+        for w in sorted(restocks, key=lambda w: -(w.delta or 0))[:15]:
             lines.append(f"    {w.delta:+6d}  {w.name} — now {w.cases} cases")
     for w in report.warehouse:
         lines.append(f"  {w.cases:>6}  {w.name} [{w.listing_type}]")
