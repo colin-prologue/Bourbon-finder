@@ -19,7 +19,7 @@ stages:
 | Loop | Source | Cadence | What it catches |
 |---|---|---|---|
 | `poll-stocks` | Warehouse Stock Report (`abc2.nc.gov/StoresBoards/Stocks`) | every 15–20 min | **Stage A (radar):** Allocation/Limited items appearing in state stock; drawdowns as boards order |
-| `poll-boards` | Per-store board sites: New Hanover (ABC/GO), Durham, Greensboro | 2–4×/day | **Stage B (confirmation):** which shelf a rare bottle is on right now — emits `board_restock` |
+| `poll-boards` | Per-store board sites: Durham + Greensboro (in range of Hillsborough) | 2–4×/day | **Stage B (confirmation):** which shelf a rare bottle is on right now — emits `board_restock` |
 | `poll-wake` | Wake ABC store search (`wakeabc.com`) | 2–4×/day | store-level Wake restocks with addresses and quantities (separate legacy Wake path) |
 | `poll-catalog` | Special Items, New Items, allocated-list xlsx | daily | new NC Codes entering the system (~1 month early) |
 | `poll-shipments` | *deprecated* — StockShipped was retired by NC ABC (2026-07) | — | liveness ping only; warns loudly if the state ever restores the feed |
@@ -92,9 +92,13 @@ good citizen — the defaults already are:
   in the stock report and Wake PLUs — `normalize_nc_code()` folds them.
 - The allocated-list xlsx's landing page shows a stale "Last Updated";
   the tool diffs the file bytes (sha256) instead.
-- Mecklenburg ABC has **no** public store-inventory search (old scraping
-  guides claiming otherwise are stale). Their channels: the "Spirited
-  Mailing List" (sign up by email) and Barrelpalooza events.
+- **Scope is geographic:** only boards within ~1.5h of Hillsborough are
+  polled (Durham, Wake, Greensboro). New Hanover (Wilmington) and
+  Mecklenburg (Charlotte) are ~2.5h away — out of practical driving range,
+  so they're off by default (`abcgo_boards = []`). New Hanover's adapter
+  still works; re-enable by adding `"nh"`. Mecklenburg has **no** public
+  store-inventory search anyway (its channels are the "Spirited Mailing
+  List" and Barrelpalooza events).
 - The state has migrated hosts before (abc.nc.gov → abc2.nc.gov). Header
   checksums raise `SchemaDriftError` and the health loop emails you after
   repeated failures instead of failing silently.

@@ -32,3 +32,7 @@ search_terms = ["blanton", "weller", "eh taylor", "eagle rare", "stagg", "van wi
 [boards]
 # StockShipped alerts fire only for boards matching these substrings (empty = all boards).
 watch_boards = ["Wake", "Durham", "Mecklenburg", "Orange", "Chapel Hill"]
+# ABC/GO boards off — New Hanover (only live one) is ~2.5h away, out of range
+# (back-burnered like Mecklenburg). Active in-range boards: Durham + Greensboro
+# (+ Wake via [wake]). Re-enable by listing a subdomain, e.g. ["nh"].
+abcgo_boards = []
