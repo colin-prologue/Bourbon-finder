@@ -402,13 +402,133 @@ def test_each_catalog_feed_seeds_independently():
     assert [e.key for e in events] == ["777"]
 
 
-def test_daily_alert_cap_never_gags_health_warnings():
+def test_empty_first_poll_still_establishes_a_board_baseline():
+    """ABC/GO only returns products with positive on-hand, so a first poll that
+    finds nothing is normal. Inferring seeding from stored rows meant such a
+    board never got a baseline — and its *second* poll, carrying the first real
+    restocks, was swallowed as 'still seeding'."""
+    from ncbourbon.db import connect, is_seeded
+    from ncbourbon.diff import apply_board_snapshot
+
+    conn = connect(":memory:")
+    assert apply_board_snapshot(conn, [], complete={"nh"}) == []
+    assert is_seeded(conn, "board:nh")
+
+    events = apply_board_snapshot(
+        conn, _board_rows(("27090", "Blanton's", "s1", 2)), complete={"greensboro"}
+    )
+    assert events == []                                   # greensboro seeding now
+
+    # nh already has its baseline, so its first real stock IS news.
+    from ncbourbon.sources.abcgo import BoardStoreStock
+    events = apply_board_snapshot(
+        conn, [BoardStoreStock("nh", "27090", "Blanton's", "$65", "s9", 4)], complete={"nh"}
+    )
+    assert [e.key for e in events] == ["nh:27090"]
+
+
+def test_a_failed_scope_does_not_get_a_baseline():
+    """Only a scope observed COMPLETELY may establish a baseline. Marking a
+    partial run is what makes the missing half look like news on recovery."""
+    from ncbourbon.config import WatchConfig
+    from ncbourbon.db import connect, is_seeded
+    from ncbourbon.diff import apply_catalog_items
+
+    conn = connect(":memory:")
+    # new_items succeeded; special_items threw, so it is absent from `complete`.
+    apply_catalog_items(conn, _catalog_items("new_items", range(5)), WatchConfig(),
+                        complete={"new_items"})
+    assert is_seeded(conn, "catalog:new_items")
+    assert not is_seeded(conn, "catalog:special_items")
+
+    # special_items recovers with a backlog -> silent, and only now seeded.
+    assert apply_catalog_items(
+        conn, _catalog_items("special_items", range(100, 140)), WatchConfig(),
+        complete={"special_items"},
+    ) == []
+    assert is_seeded(conn, "catalog:special_items")
+    # A genuinely new code afterwards is news.
+    assert [e.key for e in apply_catalog_items(
+        conn, _catalog_items("special_items", [777]), WatchConfig(), complete={"special_items"}
+    )] == ["777"]
+
+
+def test_catalog_feed_seeding_survives_code_deduplication():
+    """catalog is keyed by nc_code, so if every new_items code was already
+    inserted by special_items, the feed leaves no row of its own. Inferring
+    seeding from the table therefore never marks it seeded."""
+    from ncbourbon.config import WatchConfig
+    from ncbourbon.db import connect, is_seeded
+    from ncbourbon.diff import apply_catalog_items
+
+    conn = connect(":memory:")
+    both = list(range(5))
+    apply_catalog_items(conn, _catalog_items("special_items", both), WatchConfig(),
+                        complete={"special_items", "new_items"})
+    # Not one row carries source='new_items' — it was deduplicated away...
+    assert conn.execute(
+        "SELECT COUNT(*) FROM catalog WHERE source='new_items'"
+    ).fetchone()[0] == 0
+    # ...but the feed is still recorded as seeded, so its next new code alerts.
+    assert is_seeded(conn, "catalog:new_items")
+    assert [e.key for e in apply_catalog_items(
+        conn, _catalog_items("new_items", [999]), WatchConfig(), complete={"new_items"}
+    )] == ["999"]
+
+
+def test_partial_wake_run_does_not_seed():
+    from ncbourbon.db import connect, is_seeded
+    from ncbourbon.diff import apply_wake_snapshot
+    from ncbourbon.sources.wake import WakeStoreStock
+
+    conn = connect(":memory:")
+    rows = [WakeStoreStock("27090", "B", "$65", "s1", 2)]
+    apply_wake_snapshot(conn, rows, complete=False)     # a search term failed
+    assert not is_seeded(conn, "wake")
+    apply_wake_snapshot(conn, rows, complete=True)
+    assert is_seeded(conn, "wake")
+
+
+def test_board_search_terms_cover_the_whole_watch_universe():
+    """A board is only ever asked about products we name, so a gap between the
+    universe and the search terms is a silent blind spot. The old
+    sorted(terms)[:80] cut alphabetically, so Weller — Allocation-flagged — had
+    never once been searched."""
+    from ncbourbon.cli import _watchlist_terms
+    from ncbourbon.config import WatchConfig
+    from ncbourbon.db import connect
+
+    conn = connect(":memory:")
+    conn.execute(
+        "INSERT INTO stock_latest VALUES ('19791','Weller Full Proof','Allocation',12,'x')"
+    )
+    conn.execute("INSERT INTO allocated_list VALUES ('27090','Blantons Single Barrel','','L')")
+    conn.commit()
+
+    terms = _watchlist_terms(conn, WatchConfig(name_patterns=["Pappy Van Winkle"]))
+    assert "Weller Full" in terms         # warehouse Allocation/Limited
+    assert "Blantons Single" in terms     # allocated list, not currently flagged
+    assert "Pappy Van" in terms           # configured pattern
+
+    # No cap: 200 distinct brands yield 200 terms, not an alphabetical prefix.
+    for i in range(200):
+        conn.execute(
+            "INSERT INTO stock_latest VALUES (?,?,'Allocation',1,'x')",
+            (f"z{i}", f"Zbrand{i:03d} Bourbon"),
+        )
+    conn.commit()
+    assert len([t for t in _watchlist_terms(conn, WatchConfig()) if t.startswith("Zbrand")]) == 200
+
+
+def test_daily_alert_cap_never_gags_health_warnings(monkeypatch):
+    from ncbourbon import alerts as alerts_mod
     from ncbourbon.alerts import alert
     from ncbourbon.config import AlertConfig
     from ncbourbon.db import connect
 
+    monkeypatch.setattr(alerts_mod, "send_email", lambda cfg, subject, body: True)
     conn = connect(":memory:")
-    cfg = AlertConfig(max_daily_alerts=3, cooldown_hours=0)   # email disabled -> logged
+    cfg = AlertConfig(max_daily_alerts=3, cooldown_hours=0)
     for i in range(6):
         alert(conn, cfg, "board_restock", f"k{i}", f"subject {i}", "body")
     sent = conn.execute(
@@ -421,6 +541,40 @@ def test_daily_alert_cap_never_gags_health_warnings():
     # The scraper-is-broken alert still gets through a spent budget.
     alert(conn, cfg, "health", "stocks", "source failing", "body")
     assert conn.execute("SELECT COUNT(*) FROM alert_log WHERE kind='health'").fetchone()[0] == 1
+
+
+def test_undelivered_alerts_do_not_consume_the_daily_cap(monkeypatch):
+    """An SMTP outage must not burn the day's budget. alert() logs a row even
+    when the send fails, so counting rows rather than deliveries meant a failing
+    mail server could silently suppress every real alert for the next 24h —
+    after service came back."""
+    from ncbourbon import alerts as alerts_mod
+    from ncbourbon.alerts import alert
+    from ncbourbon.config import AlertConfig
+    from ncbourbon.db import connect
+
+    conn = connect(":memory:")
+    cfg = AlertConfig(max_daily_alerts=3, cooldown_hours=0)
+
+    monkeypatch.setattr(alerts_mod, "send_email", lambda cfg, subject, body: False)
+    for i in range(5):
+        alert(conn, cfg, "board_restock", f"outage{i}", f"subject {i}", "body")
+    assert conn.execute(
+        "SELECT COUNT(*) FROM alert_log WHERE kind LIKE 'capped:%'"
+    ).fetchone()[0] == 0                      # nothing capped: nothing was delivered
+
+    # SMTP recovers — the full budget is still available.
+    monkeypatch.setattr(alerts_mod, "send_email", lambda cfg, subject, body: True)
+    for i in range(3):
+        alert(conn, cfg, "board_restock", f"ok{i}", f"subject {i}", "body")
+    assert conn.execute(
+        "SELECT COUNT(*) FROM alert_log WHERE message LIKE '[sent]%'"
+    ).fetchone()[0] == 3
+    # ...and only now does the cap bind.
+    alert(conn, cfg, "board_restock", "over", "one too many", "body")
+    assert conn.execute(
+        "SELECT COUNT(*) FROM alert_log WHERE kind='capped:board_restock'"
+    ).fetchone()[0] == 1
 
 
 def test_board_history_records_changes_not_rereadings(monkeypatch):

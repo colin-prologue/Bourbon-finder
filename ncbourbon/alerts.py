@@ -45,7 +45,12 @@ def sent_today(conn: sqlite3.Connection) -> int:
     return conn.execute(
         "SELECT COUNT(*) FROM alert_log WHERE sent_at > "
         "strftime('%Y-%m-%dT%H:%M:%SZ','now','-1 day') "
-        "AND kind NOT IN ('health') AND kind NOT LIKE 'capped:%'"
+        "AND kind NOT IN ('health') AND kind NOT LIKE 'capped:%' "
+        # Only delivered mail counts. alert() logs a row even when the send
+        # fails, so counting every row meant an SMTP outage could burn the whole
+        # day's budget without a single email arriving — and then suppress the
+        # real alerts for 24h after service came back.
+        "AND message LIKE '[sent]%'"
     ).fetchone()[0]
 
 

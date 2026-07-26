@@ -38,7 +38,7 @@ import sqlite3
 from dataclasses import dataclass
 
 from .config import WatchConfig
-from .db import now_iso
+from .db import is_seeded, mark_seeded, now_iso
 from .sources.stocks import StockRow
 from .sources.abcgo import BoardStoreStock
 from .sources.wake import WakeStoreStock
@@ -158,18 +158,20 @@ def apply_stock_snapshot(
     return events
 
 
-def apply_catalog_items(conn: sqlite3.Connection, items, watch: WatchConfig) -> list[Event]:
+def apply_catalog_items(
+    conn: sqlite3.Connection, items, watch: WatchConfig, complete: set[str] | None = None
+) -> list[Event]:
     events: list[Event] = []
     ts = now_iso()
-    # Seeding is tracked per feed, not for the catalog as a whole. poll-catalog
-    # pulls special_items and new_items independently and persists whatever
-    # succeeded, so one feed failing on the first run would leave the table
-    # non-empty; when that feed later succeeded, every one of its pre-existing
-    # codes would read as new and burn the daily cap. A feed with no rows of its
-    # own has not been seeded yet, whatever the other feeds have done.
-    seeded_sources = {
-        r["source"] for r in conn.execute("SELECT DISTINCT source FROM catalog")
-    }
+    # Seeding is tracked per feed against the `seeded` table, not inferred from
+    # the catalog's contents. poll-catalog pulls special_items and new_items
+    # independently and persists whatever succeeded, and catalog rows are
+    # deduplicated by nc_code — so a feed whose codes were all already inserted
+    # by the other feed leaves no trace of itself and would look unseeded
+    # forever. `complete` is the set of feeds that actually fetched cleanly this
+    # run; only those may establish a baseline.
+    if complete is None:
+        complete = {it.source for it in items}
     for it in items:
         exists = conn.execute("SELECT 1 FROM catalog WHERE nc_code=?", (it.nc_code,)).fetchone()
         if exists:
@@ -180,7 +182,7 @@ def apply_catalog_items(conn: sqlite3.Connection, items, watch: WatchConfig) -> 
             (it.nc_code, it.brand_name, it.source, it.retail_price, ts),
         )
         interesting = name_watched(it.brand_name, watch)
-        seeding = it.source not in seeded_sources
+        seeding = not is_seeded(conn, f"catalog:{it.source}")
         if not seeding and (it.source in ("special_items", "new_items") or interesting):
             events.append(
                 Event(
@@ -192,6 +194,8 @@ def apply_catalog_items(conn: sqlite3.Connection, items, watch: WatchConfig) -> 
                     "this item is entering the NC system.",
                 )
             )
+    for source in complete:
+        mark_seeded(conn, f"catalog:{source}")
     conn.commit()
     return events
 
@@ -223,6 +227,7 @@ def apply_wake_snapshot(
     conn: sqlite3.Connection,
     rows: list[WakeStoreStock],
     alertable: set[str] | None = None,
+    complete: bool = True,
 ) -> list[Event]:
     """Legacy standalone Wake path. Same three rules as apply_board_snapshot:
     persist every row, alert once per product, stay silent while seeding."""
@@ -252,7 +257,11 @@ def apply_wake_snapshot(
                     (ts, plu, store),
                 )
                 prev[(plu, store)] = (0, _price)
-    seeding = not prev
+    # `complete` is False when some search term failed this run. Wake is polled
+    # term by term and partial results are persisted, so treating a partial run
+    # as the baseline would make the missing terms' existing stock read as
+    # restocks the moment they recover.
+    seeding = not is_seeded(conn, "wake")
     restocked: dict[str, list[WakeStoreStock]] = {}
     for r in rows:
         old_qty, old_price = prev.get((r.plu, r.store), (None, None))
@@ -293,6 +302,8 @@ def apply_wake_snapshot(
                 "bottles may already be gone.",
             )
         )
+    if complete:
+        mark_seeded(conn, "wake")
     conn.commit()
     return events
 
@@ -302,6 +313,7 @@ def apply_board_snapshot(
     rows: list[BoardStoreStock],
     observed: set[tuple[str, str]] | None = None,
     alertable: set[str] | None = None,
+    complete: set[str] | None = None,
 ) -> list[Event]:
     """Store-level board inventory. Emits one board_restock per (board, code)
     that went 0 -> >0 at one or more stores — confirmation a rare bottle is on
@@ -328,9 +340,17 @@ def apply_board_snapshot(
         (r["board"], r["plu"], r["store"]): r["qty"]
         for r in conn.execute("SELECT board, plu, store, qty FROM board_latest").fetchall()
     }
-    # A board with no prior rows is being seeded: its whole current inventory
-    # would read as one giant restock. Persist it, say nothing.
-    seeded = {b for b, _, _ in prev}
+    # A board's first complete observation is its baseline: the whole current
+    # inventory would otherwise read as one giant restock. This is recorded in
+    # `seeded` rather than inferred from board_latest, because a first poll that
+    # legitimately returns nothing produces no rows — and for ABC/GO, which only
+    # returns products with positive on-hand, that is the normal case. Inferring
+    # from rows meant such a board never got a baseline, so the *second* poll's
+    # genuine restocks were swallowed as "still seeding".
+    if complete is None:
+        complete = {r.board for r in rows}
+    seeded = {b for b in complete if is_seeded(conn, f"board:{b}")}
+    seeded |= {b for b, _, _ in prev}   # boards seeded before this table existed
     present = {(r.board, r.plu, r.store) for r in rows}
     restocked: dict[tuple[str, str], list[BoardStoreStock]] = {}
     for r in rows:
@@ -388,5 +408,7 @@ def apply_board_snapshot(
                 "this as a picture, not a starting gun.",
             )
         )
+    for board in complete:
+        mark_seeded(conn, f"board:{board}")
     conn.commit()
     return events

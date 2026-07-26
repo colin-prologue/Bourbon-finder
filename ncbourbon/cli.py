@@ -88,31 +88,60 @@ def cmd_poll_shipments(conn, cfg, session):
                 len(form.board_options))
 
 
-def _watchlist_terms(conn, limit: int = 80) -> list[str]:
-    """Search terms for the board APIs, derived from the live Allocation/Limited
-    warehouse watchlist: first two words of each brand (a good substring filter
-    for the boards' inventory search)."""
-    terms = set()
+def _watchlist_terms(conn, watch) -> list[str]:
+    """Search terms for the board APIs, covering the WHOLE watch universe.
+
+    A board is only ever asked about products we name, so any gap between the
+    universe and these terms is a silent blind spot — the product can be in the
+    watchlist, in the report's universe, and still never collected. Three
+    sources, matching `diff.watch_codes` plus patterns:
+
+      * Allocation/Limited brands in the warehouse right now
+      * products on the state's official allocated list, which carries items not
+        presently flagged in the warehouse
+      * the configured name_patterns themselves, which are literal brand text
+
+    First two words of each name, which is a good substring filter for these
+    search endpoints and collapses variants ("Four Roses Single Barrel OBSK" and
+    "...OESF" share one term).
+
+    There is deliberately NO cap. The old `sorted(terms)[:80]` truncated
+    alphabetically, so the same 15 brands were dropped on every single run —
+    every Weller variant, Wild Turkey, Widow Jane, Willett, Woodford,
+    Yellowstone. Weller is Allocation-flagged and had never once been searched.
+    A cap on an alphabetically sorted list is not sampling, it is a permanent
+    blind spot at the end of the alphabet.
+    """
+    terms: set[str] = set()
+
+    def add(name: str) -> None:
+        name = (name or "").strip()
+        if name:
+            terms.add(" ".join(name.split()[:2]))
+
     for r in conn.execute(
         "SELECT DISTINCT brand_name FROM stock_latest "
         "WHERE listing_type IN ('Allocation','Limited')"
-    ).fetchall():
-        name = (r["brand_name"] or "").strip()
-        if name:
-            terms.add(" ".join(name.split()[:2]))
-    return sorted(terms)[:limit]
+    ):
+        add(r["brand_name"])
+    for r in conn.execute("SELECT DISTINCT product FROM allocated_list"):
+        add(r["product"])
+    for pattern in getattr(watch, "name_patterns", []):
+        add(pattern)
+    return sorted(terms)
 
 
 def cmd_poll_boards(conn, cfg, session):
     """Board leg: poll each ABC/GO board's public per-store inventory API for the
     hot watchlist, emitting board_restock (on-shelf) alerts. Stage B of the
     two-stage model — stage A is poll-stocks (warehouse arrival)."""
-    terms = list(cfg.boards.search_terms) or _watchlist_terms(conn)
+    terms = list(cfg.boards.search_terms) or _watchlist_terms(conn, cfg.watch)
     if not terms:
         log.info("poll-boards: empty watchlist and no configured search_terms; run poll-stocks first")
         return
     all_rows = []
     observed: set[tuple[str, str]] = set()   # (board, code) whose per-store state we know this run
+    complete: set[str] = set()               # boards that fetched cleanly -> may establish a baseline
     for board in cfg.boards.abcgo_boards:
         ok, err = True, ""
         try:
@@ -133,6 +162,7 @@ def cmd_poll_boards(conn, cfg, session):
             board_rows.extend(recheck_rows)
             all_rows.extend(board_rows)
             observed |= {(board, c) for c in found} | recheck_obs
+            complete.add(board)
         except Exception as exc:  # noqa: BLE001
             ok, err = False, f"{board}: {exc}"
             log.warning("abcgo board %s failed: %s", board, exc, exc_info=True)
@@ -144,6 +174,8 @@ def cmd_poll_boards(conn, cfg, session):
         except Exception as exc:  # noqa: BLE001
             ok, err = False, str(exc)
             log.warning("durham board failed: %s", exc, exc_info=True)
+        if ok:
+            complete.add("durham")
         _health(conn, cfg, "durham", ok, err)
     if cfg.boards.greensboro:
         ok, err = True, ""
@@ -152,9 +184,12 @@ def cmd_poll_boards(conn, cfg, session):
         except Exception as exc:  # noqa: BLE001
             ok, err = False, str(exc)
             log.warning("greensboro board failed: %s", exc, exc_info=True)
+        if ok:
+            complete.add("greensboro")
         _health(conn, cfg, "greensboro", ok, err)
     events = apply_board_snapshot(
-        conn, all_rows, observed=observed, alertable=alertable_codes(conn, cfg.watch, all_rows)
+        conn, all_rows, observed=observed,
+        alertable=alertable_codes(conn, cfg.watch, all_rows), complete=complete,
     )
     _emit(conn, cfg, events)
     log.info("boards: %d store-rows across %d board(s), %d events",
@@ -165,14 +200,21 @@ def cmd_poll_catalog(conn, cfg, session):
     ok = True
     err = ""
     items = []
-    for fn in (catalog_mod.fetch_special_items, catalog_mod.fetch_new_items):
+    # Only a feed that fetched cleanly may establish its own baseline — a failed
+    # feed must stay unseeded so its backlog is silent when it recovers.
+    complete: set[str] = set()
+    for fn, source in (
+        (catalog_mod.fetch_special_items, "special_items"),
+        (catalog_mod.fetch_new_items, "new_items"),
+    ):
         try:
             items.extend(fn(session, timeout=cfg.request_timeout))
+            complete.add(source)
         except Exception as exc:  # noqa: BLE001
             ok = False
             err = f"{fn.__name__}: {exc}"
             log.warning(err)
-    events = apply_catalog_items(conn, items, cfg.watch)
+    events = apply_catalog_items(conn, items, cfg.watch, complete=complete)
     # allocated xlsx: byte-diff then parse
     try:
         content, sha = catalog_mod.fetch_allocated_xlsx(session, timeout=cfg.request_timeout)
@@ -230,7 +272,12 @@ def cmd_poll_wake(conn, cfg, session):
     for r in all_rows:
         seen[(r.plu, r.store)] = r
     rows = list(seen.values())
-    events = apply_wake_snapshot(conn, rows, alertable=alertable_codes(conn, cfg.watch, rows))
+    # `ok` is False if any search term failed. A partial run must not become the
+    # baseline, or the missing terms' existing stock reads as restocks when they
+    # recover.
+    events = apply_wake_snapshot(
+        conn, rows, alertable=alertable_codes(conn, cfg.watch, rows), complete=ok
+    )
     _emit(conn, cfg, events)
     log.info("wake: %d store-rows, %d events", len(seen), len(events))
 
