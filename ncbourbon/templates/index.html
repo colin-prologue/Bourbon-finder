@@ -106,6 +106,7 @@
   </p>
 </div>
 
+<script type="application/json" id="report">null</script>
 <script>
 const $ = s => document.querySelector(s);
 const KEY = "ncbourbon.watch";
@@ -285,19 +286,33 @@ function renderSources() {
   }
 }
 
+function draw(d) {
+  DATA = d;
+  $("#asof").textContent =
+    `Updated ${ago(d.generated_at)}. Boards refresh a couple of times a day — ` +
+    `this is a picture, not a live feed.`;
+  renderSources();
+  renderShelf();
+  renderChanges();
+  renderWarehouse();
+}
+
+// The report is baked into the page at render time, so opening index.html
+// straight off disk works — browsers block fetch() from a file:// origin, and
+// that is exactly what `render-site` hands you. Over http the sibling
+// data.json is then re-fetched for a fresher copy; failing that is harmless
+// because the embedded copy is already on screen.
+let embedded = null;
+try { embedded = JSON.parse(document.getElementById("report").textContent); } catch {}
+if (embedded) draw(embedded);
+else $("#asof").textContent = "Loading…";
+
 fetch("data.json", { cache: "no-store" })
   .then(r => r.json())
-  .then(d => {
-    DATA = d;
-    $("#asof").textContent =
-      `Updated ${ago(d.generated_at)}. Boards refresh a couple of times a day — ` +
-      `this is a picture, not a live feed.`;
-    renderSources();
-    renderShelf();
-    renderChanges();
-    renderWarehouse();
-  })
-  .catch(() => { $("#asof").textContent = "Could not load data.json."; });
+  .then(draw)
+  .catch(() => {
+    if (!embedded) $("#asof").textContent = "Could not load data.json.";
+  });
 
 $("#q").addEventListener("input", renderShelf);
 $("#starred").addEventListener("click", e => {

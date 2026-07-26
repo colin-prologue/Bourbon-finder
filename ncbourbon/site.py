@@ -17,7 +17,6 @@ email subscriptions ever become the ask, that is the moment to add a backend.
 from __future__ import annotations
 
 import json
-import shutil
 import sqlite3
 from pathlib import Path
 
@@ -27,12 +26,41 @@ from .report import build_report, render_json
 TEMPLATE = Path(__file__).parent / "templates" / "index.html"
 
 
+PLACEHOLDER = '<script type="application/json" id="report">null</script>'
+
+
+def _embed(payload: dict) -> str:
+    """Serialise a report for inline embedding in a <script> block.
+
+    `</script>` anywhere in the data would close the block early and drop the
+    remainder into the document as markup — and product names come from scraped
+    feeds, so that is attacker-reachable, not hypothetical. Escaping `<` as its
+    unicode form is valid JSON, parses identically, and cannot terminate the
+    element.
+    """
+    return json.dumps(payload, sort_keys=True).replace("<", "\\u003c")
+
+
 def render_site(conn: sqlite3.Connection, cfg: Config, out_dir: str) -> Path:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     data = render_json(build_report(conn, cfg))
     (out / "data.json").write_text(json.dumps(data, indent=1, sort_keys=True))
-    shutil.copyfile(TEMPLATE, out / "index.html")
+
+    # The report is embedded in the page AND written alongside it. Browsers
+    # block fetch() from a file:// origin, so a page that only fetched showed
+    # nothing but an error when opened straight from disk — which is exactly
+    # what the documented `render-site` command produces. Embedding makes the
+    # output work on its own; data.json stays for the deployed page to re-fetch
+    # a fresher copy, and for anything else that wants the data.
+    html = TEMPLATE.read_text()
+    if PLACEHOLDER not in html:
+        raise RuntimeError("index.html lost its report placeholder")
+    html = html.replace(
+        PLACEHOLDER,
+        f'<script type="application/json" id="report">{_embed(data)}</script>',
+    )
+    (out / "index.html").write_text(html)
     # Tell Pages not to run the content through Jekyll, which would otherwise
     # swallow files it does not recognise.
     (out / ".nojekyll").write_text("")

@@ -1098,6 +1098,18 @@ def test_render_site_writes_a_self_contained_page(tmp_path):
 
     html = (out / "index.html").read_text()
     assert (out / ".nojekyll").exists()          # Pages must not run this through Jekyll
+
+    # The report is embedded, so the page works opened straight off disk —
+    # browsers block fetch() from file://, which is exactly what render-site
+    # produces. Verified in a browser with data.json deleted entirely.
+    import re
+    embedded = re.search(
+        r'<script type="application/json" id="report">(.*?)</script>', html, re.S
+    ).group(1)
+    assert json.loads(embedded)["shelf"][0]["nc_code"] == "27090"
+    # "</script>" in a scraped product name would close the block early and drop
+    # the rest into the document as markup, so "<" must never appear raw.
+    assert "<" not in embedded
     assert "noindex" in html                     # a personal tool, not a public listing
     # No external fetches: the only network call is for the sibling data file.
     for reach in ("https://", "http://", "src="):
