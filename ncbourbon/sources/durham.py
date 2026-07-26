@@ -244,7 +244,11 @@ def fetch_durham_stock(
                 cards.append(card)
     # A single unbadged card fails open on its own (tier 2). Every card losing
     # its badge is the different, louder problem: the selector stopped working.
-    classified = any(c.category for c in cards)
+    # No cards at all is neither — an empty set has nothing to classify, and
+    # Durham legitimately carries nothing for many watchlist terms. Reading
+    # `any([])` as failure flagged a healthy, complete poll as needing
+    # attention on the site and in the digest.
+    classified = any(c.category for c in cards) if cards else True
     tiered = [(_tier(c, priority_codes, name_patterns), c) for c in cards]
     # Stable sort: tier 1 first, first-seen order preserved within each tier.
     wanted = [c for tier, c in sorted(tiered, key=lambda tc: tc[0]) if tier <= 2]

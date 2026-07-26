@@ -1746,6 +1746,10 @@ def test_durham_believes_an_empty_search_that_says_it_is_empty(monkeypatch):
     rows, coverage = durham.fetch_durham_stock(object(), ["nothing here"])
     assert rows == [] and requested == []
     assert coverage.matched == 0 and coverage.relevant == 0
+    # An empty set has nothing to classify. Reporting a classification failure
+    # here flagged a healthy, complete poll as needing attention on the site
+    # and in the digest — a false alarm on the most ordinary outcome there is.
+    assert coverage.classified
 
 
 def test_durham_fails_open_when_only_the_name_markup_changes(monkeypatch):
