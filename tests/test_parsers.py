@@ -1553,7 +1553,7 @@ def test_durham_fetch_end_to_end(monkeypatch):
     from ncbourbon.sources.abcgo import BoardStoreStock
 
     class _Resp:
-        def __init__(self, text): self.text = text
+        def __init__(self, text): self.text, self.status_code = text, 200
 
     def fake_fetch(session, method, url, *, timeout=60, data=None, json=None, headers=None):
         if "/search" in url:
@@ -1563,6 +1563,7 @@ def test_durham_fetch_end_to_end(monkeypatch):
         raise AssertionError("unexpected url " + url)
 
     monkeypatch.setattr(durham, "fetch", fake_fetch)
+    monkeypatch.setattr(durham.time, "sleep", lambda _s: None)
     rows, coverage = durham.fetch_durham_stock(object(), ["eh taylor"])
     assert all(isinstance(r, BoardStoreStock) and r.board == "durham" for r in rows)
     assert len(rows) == 2                      # dup /products link deduped -> one code, two stores
@@ -1574,20 +1575,35 @@ def test_durham_fetch_end_to_end(monkeypatch):
     assert coverage.matched == 1 and coverage.classified
 
 
-def _durham_harness(monkeypatch, search_html: str):
+# A real product page nobody stocks: no <table>, but price and badge intact.
+# 62 of the 127 relevant codes looked like this on 2026-07-26.
+_DURHAM_NO_STORES = """
+<html><body>
+  <h1>Weller Full Proof</h1>
+  <span class="badge">Limited / Allocated</span>
+  <div>PLU 111 &middot; .75L $39.95</div>
+</body></html>
+"""
+
+# Durham's 404. Note it has an <h1> too — the heading alone proves nothing.
+_DURHAM_NOT_FOUND = "<html><body><h1>Product Not Found</h1></body></html>"
+
+
+def _durham_harness(monkeypatch, search_html: str, detail=None, status: int = 200):
     """Patch durham's fetch + sleep; return the list of detail codes requested."""
     from ncbourbon.sources import durham
 
     requested: list[str] = []
 
     class _Resp:
-        def __init__(self, text): self.text = text
+        def __init__(self, text, code=200):
+            self.text, self.status_code = text, code
 
     def fake_fetch(session, method, url, *, timeout=60, data=None, json=None, headers=None):
         if "/search" in url:
             return _Resp(search_html)
         requested.append(url.rsplit("/", 1)[-1])
-        return _Resp(_DURHAM_DETAIL)
+        return _Resp(detail if detail is not None else _DURHAM_DETAIL, status)
 
     monkeypatch.setattr(durham, "fetch", fake_fetch)
     monkeypatch.setattr(durham.time, "sleep", lambda _s: None)
@@ -1633,15 +1649,13 @@ def test_durham_sellout_is_observable_when_the_store_table_vanishes(monkeypatch)
     apply_board_snapshot(conn, [BoardStoreStock("durham", "111", "Weller", "$40", store, 3)])
 
     # Next run: still relevant, still fetched — but Durham now serves the page
-    # with no <table>, meaning no store carries it.
+    # with no <table>, meaning no store carries it. Price and badge stay put,
+    # which is what separates this from an error page.
     html = f'<div>{_durham_card("111", "Limited / Allocated", "Weller")}</div>'
-    requested = _durham_harness(monkeypatch, html)
-    monkeypatch.setattr(durham, "details_stores",
-                        lambda s, code, timeout=60: {"name": "Weller", "price": "$40", "stores": []})
+    _durham_harness(monkeypatch, html, detail=_DURHAM_NO_STORES)
 
     rows, coverage = durham.fetch_durham_stock(object(), ["x"])
     assert rows == [] and coverage.observed == {"111"}
-    assert requested == []          # details_stores stubbed; harness still patched fetch
 
     apply_board_snapshot(conn, rows, observed={("durham", c) for c in coverage.observed})
     assert conn.execute(
@@ -1707,6 +1721,46 @@ def test_durham_fails_open_when_the_badge_markup_changes(monkeypatch):
     assert sorted(requested) == ["777", "888"]      # nothing dropped
     assert not coverage.classified
     assert coverage.relevant == coverage.fetched == 2
+
+
+@pytest.mark.parametrize(
+    "detail, status, label",
+    [
+        (_DURHAM_NOT_FOUND, 404, "404 product-not-found"),
+        ("<html><body><h1>Access Denied</h1></body></html>", 403, "WAF block"),
+        # NC ABC sites serve error pages with HTTP 200, so status alone is not
+        # enough to tell a real page from a broken one.
+        ("<html><body><h1>Server Error</h1></body></html>", 200, "HTTP-200 error page"),
+    ],
+)
+def test_durham_will_not_call_an_unreadable_page_a_sellout(monkeypatch, detail, status, label):
+    """The dangerous ambiguity: an error page and a genuine "nobody stocks it"
+    both parse to zero stores. Treating the former as authoritative zeroes every
+    store for that code, and the next healthy poll fires a burst of false
+    board_restock alerts — sending someone driving for a bottle that never
+    moved. Polls run from GitHub Actions, whose IPs do get WAF-blocked."""
+    from ncbourbon.db import connect
+    from ncbourbon.diff import apply_board_snapshot
+    from ncbourbon.sources import durham
+    from ncbourbon.sources.abcgo import BoardStoreStock
+
+    conn = connect(":memory:")
+    store = "1928 Holloway Street Durham, NC 27703"
+    apply_board_snapshot(conn, [BoardStoreStock("durham", "111", "Weller", "$40", store, 3)])
+
+    html = f'<div>{_durham_card("111", "Limited / Allocated", "Weller")}</div>'
+    _durham_harness(monkeypatch, html, detail=detail, status=status)
+
+    rows, coverage = durham.fetch_durham_stock(object(), ["x"])
+    assert rows == []
+    assert coverage.observed == set(), f"{label} must not be authoritative"
+    # A page we could not read is not a page we read: the shortfall is visible.
+    assert coverage.fetched == 0 and coverage.relevant == 1
+
+    apply_board_snapshot(conn, rows, observed={("durham", c) for c in coverage.observed})
+    assert conn.execute(
+        "SELECT qty FROM board_latest WHERE board='durham' AND plu='111'"
+    ).fetchone()[0] == 3, "stale beats fabricated — the known quantity stands"
 
 
 def test_report_shows_a_partial_read_not_just_a_green_light(monkeypatch):

@@ -169,8 +169,24 @@ def parse_product(html: str) -> dict:
 
 
 def details_stores(session, code: str, timeout: int = 60) -> dict:
+    """Parse one product page, and say whether it was a product page at all.
+
+    `fetch` returns non-200 bodies rather than raising (only 5xx does), and NC
+    ABC sites serve error pages with HTTP 200 besides — so the caller cannot
+    tell a real page from a WAF block by status alone, and both parse to an
+    empty `stores` list. That ambiguity is dangerous here: an empty parse is
+    also how a genuine "no store carries this" reads.
+
+    A real product page always carries a price and a category badge, stocked or
+    not. Durham's 404 renders an <h1> of "Product Not Found" and neither — so
+    the <h1> alone is not evidence. If Durham ever drops both from its markup
+    we stop marking pages observed, which costs us sellout detection but never
+    invents a restock; that is the right direction to fail in.
+    """
     resp = fetch(session, "GET", f"{BASE}/products/{code}", timeout=timeout)
-    return parse_product(resp.text)
+    info = parse_product(resp.text)
+    info["valid"] = resp.status_code == 200 and bool(info["price"] or info["category"])
+    return info
 
 
 def fetch_durham_stock(
@@ -209,16 +225,25 @@ def fetch_durham_stock(
 
     out: list[BoardStoreStock] = []
     observed: set[str] = set()
+    unreadable = 0
     for i, card in enumerate(wanted[:MAX_DETAIL_FETCHES]):
         if i:
             time.sleep(REQUEST_DELAY_SECONDS)
         info = details_stores(session, card.code, timeout=timeout)
+        if not info["valid"]:
+            # Not a page we can believe. Saying nothing leaves the last known
+            # state standing, which is merely stale; calling it authoritative
+            # would zero every store for this code and then fire a burst of
+            # false board_restock alerts on the next healthy poll — sending
+            # someone driving to a store for a bottle that never moved.
+            unreadable += 1
+            continue
         # A product no store carries renders with no store table at all (HTTP
-        # 200, no <table> — 62 of 127 relevant codes on 2026-07-26), so it
-        # yields no rows. That is an answer, not a miss: the code is observed,
-        # and apply_board_snapshot zeroes its stale board_latest rows. Without
-        # this, a Durham bottle that sold out everywhere would stay "in stock"
-        # in the report forever and could never fire a restock again.
+        # 200, no <table>, but price and badge intact — 62 of 127 relevant codes
+        # on 2026-07-26), so it yields no rows. That is an answer, not a miss:
+        # the code is observed, and apply_board_snapshot zeroes its stale
+        # board_latest rows. Without this, a Durham bottle that sold out
+        # everywhere would stay "in stock" forever and never fire a restock.
         observed.add(card.code)
         for address, qty in info["stores"]:
             out.append(
@@ -234,10 +259,20 @@ def fetch_durham_stock(
     coverage = Coverage(
         matched=len(cards),
         relevant=len(wanted),
-        fetched=min(len(wanted), MAX_DETAIL_FETCHES),
+        # Pages we could not read do not count as read — otherwise a run that a
+        # WAF blocked end to end reports full coverage. Counting only believed
+        # pages makes `fetched < relevant` the one signal for both a bound
+        # ceiling and a blocked poll, and the report says so either way.
+        fetched=len(observed),
         classified=classified,
         observed=observed,
     )
+    if unreadable:
+        log.warning(
+            "durham: %d of %d detail pages were not product pages (WAF block or "
+            "error page?) — left untouched rather than zeroed",
+            unreadable, min(len(wanted), MAX_DETAIL_FETCHES),
+        )
     if not classified and cards:
         log.warning(
             "durham: no category badge parsed from %d cards — the search markup "
