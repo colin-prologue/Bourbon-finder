@@ -12,7 +12,7 @@ import sqlite3
 from email.message import EmailMessage
 
 from .config import AlertConfig
-from .db import log_alert, now_iso, recently_alerted
+from .db import log_alert, recently_alerted
 
 log = logging.getLogger(__name__)
 
@@ -82,25 +82,16 @@ def alert(
     log_alert(conn, kind, key, f"[{'sent' if sent else 'logged'}] {subject}")
 
 
-def send_digest(conn: sqlite3.Connection, cfg: AlertConfig) -> None:
-    """Daily digest: current Allocation/Limited items with stock, recent alerts."""
-    rows = conn.execute(
-        "SELECT nc_code, brand_name, listing_type, total_available FROM stock_latest "
-        "WHERE listing_type IN ('Allocation','Limited') AND total_available > 0 "
-        "ORDER BY listing_type, brand_name"
-    ).fetchall()
-    recent = conn.execute(
-        "SELECT sent_at, message FROM alert_log WHERE sent_at > datetime('now','-1 day') "
-        "ORDER BY id DESC LIMIT 40"
-    ).fetchall()
-    lines = [f"NC bourbon digest — {now_iso()}", ""]
-    lines.append(f"Allocation/Limited items with warehouse stock ({len(rows)}):")
-    for r in rows:
-        lines.append(
-            f"  {r['nc_code']}  {r['brand_name']}  [{r['listing_type']}]  {r['total_available']} cases"
-        )
-    lines.append("")
-    lines.append(f"Alerts in the last 24h ({len(recent)}):")
-    for r in recent:
-        lines.append(f"  {r['sent_at']}  {r['message']}")
-    send_email(cfg, "NC bourbon daily digest", "\n".join(lines))
+def send_digest(conn: sqlite3.Connection, cfg) -> None:
+    """The daily report, mailed. Same object the site and terminal render, so
+    the three cannot drift into different answers."""
+    from .report import build_report, render_text
+
+    report = build_report(conn, cfg)
+    n = len(report.shelf)
+    subject = (
+        f"NC bourbon — {n} on shelves near you"
+        if n
+        else "NC bourbon — nothing on shelves today"
+    )
+    send_email(cfg.alerts, subject, render_text(report))

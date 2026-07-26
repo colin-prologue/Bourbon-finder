@@ -131,6 +131,7 @@ CREATE TABLE IF NOT EXISTS board_latest (
   price TEXT,
   qty INTEGER,
   updated_at TEXT,
+  store_display TEXT,   -- human label; `store` stays the stable key
   PRIMARY KEY (board, plu, store)
 );
 CREATE INDEX IF NOT EXISTS idx_board_stock_observed ON board_stock (observed_at);
@@ -159,15 +160,30 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE wake_latest ADD COLUMN price TEXT")
         conn.commit()
 
-    # History became transition-shaped. Existing rows keep prev_qty NULL, which
-    # reads as "no prior observation" — the honest answer for rows written
-    # before the column existed, and it keeps them out of the report's
-    # appeared/cleared counts rather than guessing a direction for them.
+    # History became transition-shaped. Legacy rows have no recorded direction,
+    # and NULL cannot carry that meaning: the report treats a NULL prev on a
+    # positive row as a crossing up from zero — a genuine first sighting — so
+    # every in-stock legacy row inside the report window would have been
+    # announced as newly appeared in the first digest after deploying this.
+    #
+    # Backfilling prev_qty = qty says "no change observed", which is the honest
+    # statement about a row whose direction was never recorded, and it
+    # classifies as neither an appearance nor a clearance. Only rows written
+    # after the migration carry a real transition.
     for table in ("board_stock", "wake_stock"):
         cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
         if "prev_qty" not in cols:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN prev_qty INTEGER")
+            conn.execute(f"UPDATE {table} SET prev_qty = qty WHERE prev_qty IS NULL")
             conn.commit()
+
+    # board_latest carries the stable store key; the human label used to exist
+    # only in the alert body and was lost once the poll ended. The report and
+    # site need it, so it is persisted alongside.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(board_latest)")}
+    if "store_display" not in cols:
+        conn.execute("ALTER TABLE board_latest ADD COLUMN store_display TEXT")
+        conn.commit()
 
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='warehouse_snapshot'"

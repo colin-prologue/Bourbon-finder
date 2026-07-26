@@ -54,6 +54,30 @@ production sent 5,994 emails, of which roughly 97% were noise.
 `max_daily_alerts` (default 25) is a backstop against a regression, not a
 policy. Health warnings are never capped.
 
+## The report
+
+```bash
+python -m ncbourbon report     # print it
+python -m ncbourbon digest     # mail the same thing
+```
+
+`report.build_report()` is a pure function of the database — no network, no
+formatting — and everything that shows a human what's going on renders that one
+object, so the email, the terminal, and anything downstream can't drift into
+different answers. It covers:
+
+1. **On a shelf now** — watched products with per-store quantities, restricted
+   to boards you actually poll. `board_latest` outlives configuration, so a
+   back-burnered board's rows linger; listing shelves 2.5 hours away is how a
+   report stops getting read.
+2. **Changed recently** — appeared and cleared, from the change-only history.
+3. **State warehouse** — what's held and which way it's moving. A falling count
+   means boards are ordering, the only forward-looking signal left since the
+   shipment feed was retired.
+4. **Source freshness** — per-source staleness against each loop's cadence, so
+   a silently broken scraper shows up as a stale source rather than as an
+   inbox that mysteriously went quiet.
+
 ## Setup
 
 ```bash
