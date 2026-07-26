@@ -516,6 +516,39 @@ def test_catalog_feed_seeding_survives_code_deduplication():
     )] == ["999"]
 
 
+def test_editing_wake_search_terms_does_not_fake_restocks():
+    """Wake's terms are static config rather than derived, but editing them has
+    the same effect as widening board coverage: never-searched products appear
+    and a first sighting cannot be told from an arrival."""
+    from ncbourbon.db import connect
+    from ncbourbon.diff import apply_wake_snapshot
+    from ncbourbon.sources.wake import WakeStoreStock
+
+    conn = connect(":memory:")
+    apply_wake_snapshot(conn, [WakeStoreStock("27090", "B", "$65", "s1", 2)],
+                        coverage="terms-v1")
+
+    # A term is added; a product we never asked about shows up already in stock.
+    events = apply_wake_snapshot(
+        conn,
+        [WakeStoreStock("27090", "B", "$65", "s1", 2),
+         WakeStoreStock("19791", "Weller Full Proof", "$45", "s1", 3)],
+        coverage="terms-v2",
+    )
+    assert events == []
+    assert conn.execute("SELECT qty FROM wake_latest WHERE plu='19791'").fetchone()[0] == 3
+
+    # Same terms next run: a first sighting is now a genuine arrival.
+    events = apply_wake_snapshot(
+        conn,
+        [WakeStoreStock("27090", "B", "$65", "s1", 2),
+         WakeStoreStock("19791", "Weller Full Proof", "$45", "s1", 3),
+         WakeStoreStock("20595", "Stagg", "$99", "s1", 1)],
+        coverage="terms-v2",
+    )
+    assert [e.key for e in events] == ["20595"]
+
+
 def test_partial_wake_run_does_not_seed():
     from ncbourbon.db import connect, is_seeded
     from ncbourbon.diff import apply_wake_snapshot

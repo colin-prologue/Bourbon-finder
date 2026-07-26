@@ -228,6 +228,7 @@ def apply_wake_snapshot(
     rows: list[WakeStoreStock],
     alertable: set[str] | None = None,
     complete: bool = True,
+    coverage: str | None = None,
 ) -> list[Event]:
     """Legacy standalone Wake path. Same three rules as apply_board_snapshot:
     persist every row, alert once per product, stay silent while seeding."""
@@ -262,6 +263,11 @@ def apply_wake_snapshot(
     # as the baseline would make the missing terms' existing stock read as
     # restocks the moment they recover.
     seeding = not is_seeded(conn, "wake")
+    # Wake's terms are static config rather than derived, but editing them has
+    # exactly the same effect as widening board coverage: products that were
+    # never searched suddenly appear, and a first sighting is indistinguishable
+    # from an arrival. Same fingerprint rule as apply_board_snapshot.
+    widened = coverage is not None and not is_seeded(conn, f"coverage:wake:{coverage}")
     restocked: dict[str, list[WakeStoreStock]] = {}
     for r in rows:
         old_qty, old_price = prev.get((r.plu, r.store), (None, None))
@@ -275,7 +281,12 @@ def apply_wake_snapshot(
                 "VALUES (?,?,?,?,?,?,?)",
                 (r.plu, r.name, r.price, r.store, r.qty, ts, old_qty),
             )
-        if r.store != "__ALL__" and r.qty > 0 and (old is None or old == 0) and not seeding:
+        if (
+            r.store != "__ALL__"
+            and r.qty > 0
+            and (old == 0 or (old is None and not widened))
+            and not seeding
+        ):
             restocked.setdefault(r.plu, []).append(r)
         conn.execute(
             "INSERT INTO wake_latest (plu, store, name, qty, updated_at, price) VALUES (?,?,?,?,?,?) "
@@ -304,6 +315,8 @@ def apply_wake_snapshot(
         )
     if complete:
         mark_seeded(conn, "wake")
+        if coverage is not None:
+            mark_seeded(conn, f"coverage:wake:{coverage}")
     conn.commit()
     return events
 

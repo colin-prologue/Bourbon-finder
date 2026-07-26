@@ -281,7 +281,10 @@ def cmd_poll_wake(conn, cfg, session):
     # baseline, or the missing terms' existing stock reads as restocks when they
     # recover.
     events = apply_wake_snapshot(
-        conn, rows, alertable=alertable_codes(conn, cfg.watch, rows), complete=ok
+        conn, rows, alertable=alertable_codes(conn, cfg.watch, rows), complete=ok,
+        coverage=hashlib.sha256(
+            "\n".join(sorted(cfg.wake.search_terms)).encode()
+        ).hexdigest()[:16],
     )
     _emit(conn, cfg, events)
     log.info("wake: %d store-rows, %d events", len(seen), len(events))
