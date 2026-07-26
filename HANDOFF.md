@@ -1,17 +1,40 @@
 # HANDOFF — nc-bourbon-finder (for a fresh Claude Code / dev session)
 
-Last updated: 2026-07-22. This file is self-contained: everything a new session
+Last updated: 2026-07-26. This file is self-contained: everything a new session
 needs to continue is here or in the repo. (Deeper research lives in the claude.ai
 "Bourbon" project, but you do **not** need it — the essentials are inlined below.)
 
 ## TL;DR — where things stand
-- Working tool that watches NC's liquor system for Allocation/Limited bourbon and emails on movement.
+- Working tool that watches NC's liquor system for Allocation/Limited bourbon.
+- **In flight (2026-07-26): the pivot from email-push to a pulled board.** Five
+  stacked PRs, #10 → #14, designed in #9 (`docs/superpowers/specs/2026-07-26-*`).
+  Read the spec first. In merge order: stop snapshot write amplification; fix
+  alert noise; add `report.py`; add the static site; publish to Pages + fix the
+  Actions schedule. Nothing is merged yet — awaiting Colin's review.
+- **The alert firehose is the thing being fixed.** Six days of production sent
+  5,994 emails, ~97% noise: no relevance filter on the board leg, one event per
+  store instead of per product, and baseline-seeding storms. See #11.
+- **`poll-boards` and `poll-catalog` were silently not running.** `poll.yml`
+  decided what to run by reading the clock; Actions cron drift meant the window
+  was almost never hit. Boards last succeeded 2026-07-24, catalog 2026-07-22,
+  while the workflow reported success every 20 minutes. Fixed in #14 by keying
+  dispatch on `github.event.schedule`.
+- **The DB is committed to git, so its size is the repo's size.** `.git` hit
+  166MB in five days. #10 re-keys `warehouse_snapshot` to one row per code per
+  day (248,698 → 19,131 rows; 51MB → 5.9MB) and adds `ncbourbon prune`. The
+  history already written is NOT rewritten — that needs Colin's call.
 - **Status: board leg shipped and live on `main`.** `poll-boards` (PRs #1/#3) has per-store adapters for New Hanover (ABC/GO), Durham, and Greensboro; the ABC/GO sellout→missed-restock bug is fixed (issue #2, PR #4).
-- **23/23 tests pass** (`python -m pytest tests/ -q`). Local `.venv` is Python 3.14 (fine — code needs 3.11+ for stdlib `tomllib`); `pip install -r requirements.txt` + `pip install pytest` into it.
+- **41/41 tests pass** (`python -m pytest tests/ -q`). Local `.venv` is Python 3.14 (fine — code needs 3.11+ for stdlib `tomllib`); `pip install -r requirements.txt` + `pip install pytest` into it.
 - The big change (2026-07): the state's warehouse→board shipment feed (StockShipped) was **retired by NC ABC**, so the "board leg" was rebuilt as direct per-store polling of individual board sites (`poll-boards`).
 - **Boards with working store-level adapters:** Wake (own site), Durham (own site), Greensboro (SuiteCommerce) — the **active, in-range set**. New Hanover (ABC/GO) is built and works but is **back-burnered** (see scope below).
 - **Scope (added 2026-07-26):** only poll boards within ~1.5h drive of Hillsborough. Active: **Durham, Wake, Greensboro**. Out of range → future expansion, not polled: **New Hanover** (~2.5h, Wilmington) and **Mecklenburg** (~2.5h, Charlotte). `abcgo_boards` is now empty by default; the ABC/GO adapter + New Hanover stay in the code for if we ever want them.
-- **Next work:** in-range new-board coverage is essentially exhausted (Orange/Alamance near Hillsborough have no pollable feed; see roadmap) — favor correctness/polish over more board hunts. Greensboro store-name enrichment is committed but stranded on a side branch (unpushed, needs rebase onto `main`).
+- **Next work:** review and merge #10–#14 in order. In-range new-board coverage
+  is exhausted (Orange/Alamance have no pollable feed; see roadmap), so favour
+  correctness and the pull surface over more board hunts. Greensboro store-name
+  enrichment landed on `main` (f2157bf) and now survives into the report via
+  `board_latest.store_display`.
+- **Known, unfixed:** `durham` silently caps at 60 of ~295 matched codes per run
+  (logged as a warning). Worth deciding whether to page through the rest.
 
 ## Dev environment / workflow (native, on this machine)
 - Python 3.11+ required (`config.py` uses stdlib `tomllib`). Recreate the venv locally if needed — the checked-in `.venv` points at a macOS 3.14 framework path and may be stale.
@@ -92,6 +115,16 @@ Pattern: only metro e-commerce boards whose platform exposes allocated bottles +
 - Broker Name on the warehouse report is the supplier's sales rep (a person), NOT a store — irrelevant to routing. It is already absent from the alert email body.
 
 ## Immediate next steps
-- Board leg + sellout fix are merged; `poll-boards` runs in the scheduler (`.github/workflows/poll.yml`, 3×/day) and the README loop table is current.
-- **Greensboro store-name enrichment** is in flight on a side branch (adds real store addresses to alerts via `/scs/services/Location.Service.ss`; decouples the display name from the stable store key so editing the map doesn't re-fire restocks). Review/merge when it opens a PR — it rebases on the merged `apply_board_snapshot` changes from PR #4.
+- **Review the pivot stack #10 → #14, in that order** (design in #9). They are
+  stacked, so each PR's base is the previous branch; merging out of order will
+  fight you. #10 and #11 are independently valuable — merging just those cuts
+  email volume by roughly two orders of magnitude and stops the DB growth, even
+  if the site never ships.
+- **One manual step before #14 does anything visible:** repo Settings → Pages →
+  Source → "GitHub Actions". No workflow can set it.
+- Decide on the 166MB already in `.git`. #10 stops future growth but does not
+  rewrite history.
+- Decide whether the site should be public-linkable. It is `noindex`, carries a
+  "not affiliated with NC ABC" note, and adds no polling load — one poll serves
+  every reader — but sharing it is still a step beyond a personal tool.
 - No clean new-board targets remain (see roadmap). Optional future work: TTB COLA early warning, VA ABC (v2) per the research report, or the High Point Power BI route.
