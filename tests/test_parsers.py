@@ -1806,10 +1806,19 @@ def test_report_shows_a_partial_read_not_just_a_green_light(monkeypatch):
     assert not sources["durham"].stale              # succeeded just now...
     assert "read 60 of 127" in render_text(report)  # ...but a human still sees it
 
-    # A source that could not classify its results says so instead.
+    # A source that could not classify its results says so too.
     record_coverage(conn, "durham", fetched=295, relevant=295, classified=False)
     sources = {s.source: s for s in build_report(conn, cfg).sources}
-    assert sources["durham"].note.startswith("could not classify")
+    assert sources["durham"].note == "could not classify results — read unfiltered"
+
+    # And when it also hit its ceiling, both facts survive. Falling back to
+    # reading everything is exactly when the ceiling is most likely to bind, so
+    # reporting only the classification failure would call a capped read
+    # complete in the one case the flag exists to diagnose.
+    record_coverage(conn, "durham", fetched=150, relevant=295, classified=False)
+    note = {s.source: s for s in build_report(conn, cfg).sources}["durham"].note
+    assert "could not classify" in note
+    assert "read 150 of 295" in note
 
 
 # --- Greensboro board adapter (added 2026-07-22) ----------------------------

@@ -373,15 +373,23 @@ def _sources(conn: sqlite3.Connection, boards: set[str]) -> list[SourceStatus]:
 
 
 def _coverage_note(row) -> str:
-    """Human-facing summary of a partial read; "" when the read was complete."""
+    """Human-facing summary of a partial read; "" when the read was complete.
+
+    The two conditions compose rather than exclude. A source that could not
+    classify its results falls back to reading everything, which is exactly
+    when it is most likely to hit its ceiling too — so reporting only the
+    classification failure would call a capped read complete in the one
+    scenario the flag exists to diagnose.
+    """
     if row is None:
         return ""
     fetched, relevant = row["fetched"] or 0, row["relevant"] or 0
+    parts = []
     if not row["classified"]:
-        return f"could not classify results — read all {fetched} unfiltered"
+        parts.append("could not classify results — read unfiltered")
     if fetched < relevant:
-        return f"partial coverage: read {fetched} of {relevant} relevant items"
-    return ""
+        parts.append(f"partial coverage: read {fetched} of {relevant} relevant items")
+    return "; ".join(parts)
 
 
 def build_report(conn: sqlite3.Connection, cfg: Config, window_hours: int = 24) -> Report:
