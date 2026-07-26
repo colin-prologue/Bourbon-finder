@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import logging
+import re
 
 from . import alerts as alerts_mod
 from .alerts import alert, send_digest
@@ -100,7 +101,9 @@ def _watchlist_terms(conn, watch) -> list[str]:
       * Allocation/Limited brands in the warehouse right now
       * products on the state's official allocated list, which carries items not
         presently flagged in the warehouse
-      * the configured name_patterns themselves, which are literal brand text
+      * the literal runs of each configured name_pattern — these are regexes,
+        and board endpoints do plain substring search, so the pattern itself
+        cannot be sent verbatim (see `add_pattern`)
 
     First two words of each name, which is a good substring filter for these
     search endpoints and collapses variants ("Four Roses Single Barrel OBSK" and
@@ -120,6 +123,26 @@ def _watchlist_terms(conn, watch) -> list[str]:
         if name:
             terms.add(" ".join(name.split()[:2]))
 
+    def add_pattern(pattern: str) -> None:
+        """Add the literal runs of a regex, not the regex itself.
+
+        `name_patterns` are regexes matched against product names, but board
+        endpoints do plain substring search. Sending `^(Pappy|Van Winkle)`
+        verbatim searches for the literal text `^(Pappy|Van`, which matches
+        nothing — and `alertable_codes` cannot recover the miss, because it only
+        inspects rows the search returned. The product would be watched and
+        never polled.
+
+        So split on regex metacharacters and keep the alphanumeric runs. For a
+        plain pattern like `Pappy` this is a no-op; for an alternation it yields
+        one usable term per branch. Over-broad terms are harmless — the watch
+        universe filters what alerts — while a missing term is invisible.
+        """
+        for literal in re.split(r"[^\w\s'&.-]+", pattern or ""):
+            literal = literal.strip()
+            if len(literal) >= 3:      # shorter fragments match far too much
+                add(literal)
+
     for r in conn.execute(
         "SELECT DISTINCT brand_name FROM stock_latest "
         "WHERE listing_type IN ('Allocation','Limited')"
@@ -128,7 +151,7 @@ def _watchlist_terms(conn, watch) -> list[str]:
     for r in conn.execute("SELECT DISTINCT product FROM allocated_list"):
         add(r["product"])
     for pattern in getattr(watch, "name_patterns", []):
-        add(pattern)
+        add_pattern(pattern)
     return sorted(terms)
 
 
@@ -146,7 +169,9 @@ def cmd_poll_boards(conn, cfg, session):
     for board in cfg.boards.abcgo_boards:
         ok, err = True, ""
         try:
-            board_rows = abcgo.fetch_board_stock(session, board, terms, timeout=cfg.request_timeout)
+            board_rows, trusted = abcgo.fetch_board_stock(
+                session, board, terms, timeout=cfg.request_timeout
+            )
             found = {r.plu for r in board_rows}
             # Re-query codes that were in stock last run but vanished from search
             # (ABC/GO hides sold-out items) so their sellout is detectable — see issue #2.
@@ -163,7 +188,15 @@ def cmd_poll_boards(conn, cfg, session):
             board_rows.extend(recheck_rows)
             all_rows.extend(board_rows)
             observed |= {(board, c) for c in found} | recheck_obs
-            complete.add(board)
+            # Only an authoritative read may establish a baseline. A 403 WAF page
+            # parses to an empty search result, and treating that as "this board
+            # stocks nothing" would seed an empty baseline whose recovery reads
+            # as a burst of restocks.
+            if trusted:
+                complete.add(board)
+            else:
+                ok, err = False, f"{board}: untrusted search response (blocked or non-JSON)"
+                log.warning("abcgo board %s returned an untrusted search; not seeding", board)
         except Exception as exc:  # noqa: BLE001
             ok, err = False, f"{board}: {exc}"
             log.warning("abcgo board %s failed: %s", board, exc, exc_info=True)
@@ -213,8 +246,20 @@ def cmd_poll_catalog(conn, cfg, session):
         (catalog_mod.fetch_new_items, "new_items"),
     ):
         try:
-            items.extend(fn(session, timeout=cfg.request_timeout))
-            complete.add(source)
+            got = fn(session, timeout=cfg.request_timeout)
+            items.extend(got)
+            # An NC ABC error page comes back HTTP 200 and parses to zero rows,
+            # so "no rows" cannot be distinguished from "the feed is broken".
+            # Seeding off that would mark the feed baselined, and its whole
+            # backlog would then read as new on the first healthy poll — the
+            # 4,186-email burst, rebuilt. These feeds are never legitimately
+            # empty, so treat empty as untrustworthy rather than as a baseline.
+            if got:
+                complete.add(source)
+            else:
+                ok = False
+                err = f"{fn.__name__}: returned no rows; not seeding {source}"
+                log.warning(err)
         except Exception as exc:  # noqa: BLE001
             ok = False
             err = f"{fn.__name__}: {exc}"

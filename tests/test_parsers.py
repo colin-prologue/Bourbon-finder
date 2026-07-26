@@ -549,6 +549,63 @@ def test_editing_wake_search_terms_does_not_fake_restocks():
     assert [e.key for e in events] == ["20595"]
 
 
+def test_blocked_board_search_is_not_trusted(monkeypatch):
+    """A 403 WAF page parses to an empty JSON list, indistinguishable from "this
+    board stocks nothing". Seeding off that would establish an empty baseline
+    whose recovery reads as a burst of restocks — the same conflation that
+    caused issue #2 on the details path."""
+    from ncbourbon.sources import abcgo
+
+    class _Resp:
+        def __init__(self, code, payload=None):
+            self.status_code = code
+            self._payload = payload
+        def json(self):
+            if self._payload is None:
+                raise ValueError("not json")
+            return self._payload
+
+    # Healthy but genuinely empty -> trusted.
+    monkeypatch.setattr(abcgo, "fetch", lambda *a, **k: _Resp(200, []))
+    rows, trusted = abcgo.fetch_board_stock(object(), "nh", ["weller"])
+    assert (rows, trusted) == ([], True)
+
+    # 403 WAF page -> NOT trusted, even though it also yields no rows.
+    monkeypatch.setattr(abcgo, "fetch", lambda *a, **k: _Resp(403, None))
+    rows, trusted = abcgo.fetch_board_stock(object(), "nh", ["weller"])
+    assert (rows, trusted) == ([], False)
+
+    # One bad term among several poisons the whole run: a partial picture of a
+    # board is not a baseline.
+    calls = {"n": 0}
+    def flaky(*a, **k):
+        calls["n"] += 1
+        return _Resp(200, []) if calls["n"] == 1 else _Resp(403, None)
+    monkeypatch.setattr(abcgo, "fetch", flaky)
+    _rows, trusted = abcgo.fetch_board_stock(object(), "nh", ["weller", "blanton"])
+    assert trusted is False
+
+
+def test_name_patterns_become_literal_search_terms():
+    """name_patterns are regexes, but board endpoints do substring search.
+    Sending `^(Pappy|Van Winkle)` verbatim searches for `^(Pappy|Van`, which
+    matches nothing — and the miss is unrecoverable, because alertable_codes
+    only inspects rows the search returned."""
+    from ncbourbon.cli import _watchlist_terms
+    from ncbourbon.config import WatchConfig
+    from ncbourbon.db import connect
+
+    conn = connect(":memory:")
+    terms = _watchlist_terms(conn, WatchConfig(
+        name_patterns=[r"^(Pappy|Van Winkle)", r"William\s+Larue", "Weller"]
+    ))
+    assert "Pappy" in terms
+    assert "Van Winkle" in terms
+    assert "Weller" in terms
+    # No regex syntax leaks into a term.
+    assert not [t for t in terms if any(c in t for c in "^()|\\[]*+?")]
+
+
 def test_partial_wake_run_does_not_seed():
     from ncbourbon.db import connect, is_seeded
     from ncbourbon.diff import apply_wake_snapshot
