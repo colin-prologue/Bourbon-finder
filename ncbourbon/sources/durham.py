@@ -54,6 +54,14 @@ ALLOCATED_BADGE_RE = re.compile(r"allocat|limited", re.I)
 # report rather than only in the log.
 MAX_DETAIL_FETCHES = 150
 REQUEST_DELAY_SECONDS = 0.3  # `http.fetch` has no throttle of its own
+# Which codes a run decides to detail-fetch is part of this board's coverage,
+# just as much as the search terms are — and the differ's coverage fingerprint
+# is built from terms alone, so it cannot see a change on this axis. Bump this
+# whenever `_tier` changes what gets fetched: the next run then treats first
+# sightings as newly-covered ground rather than as arrivals. Without it,
+# narrowing 295 matches to a targeted 127 made six bottles that had been
+# sitting on Durham shelves all along announce themselves as fresh restocks.
+SELECTION_POLICY = "tiered-v1"
 
 
 @dataclass(frozen=True)

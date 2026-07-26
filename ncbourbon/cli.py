@@ -160,6 +160,22 @@ def _watchlist_terms(conn, watch) -> list[str]:
     return sorted(terms)
 
 
+def _coverage_fingerprint(terms: list[str]) -> str:
+    """Fingerprint of what a run covered, so the differ can tell "this bottle
+    just arrived" from "we just started looking for it" — see
+    apply_board_snapshot.
+
+    Terms are most of the answer, but not all of it: Durham decides which of
+    the matched codes are worth a detail fetch, so a change to that rule widens
+    coverage without touching a single term. Folding its policy in keeps the
+    fingerprint honest about the whole of what was covered. It is shared across
+    boards, so bumping it costs the others one silent poll — and a board whose
+    coverage did not change has no first sightings to silence anyway.
+    """
+    parts = [*sorted(terms), f"durham-selection:{durham.SELECTION_POLICY}"]
+    return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
+
+
 def cmd_poll_boards(conn, cfg, session):
     """Board leg: poll each ABC/GO board's public per-store inventory API for the
     hot watchlist, emitting board_restock (on-shelf) alerts. Stage B of the
@@ -240,9 +256,7 @@ def cmd_poll_boards(conn, cfg, session):
         if ok:
             complete.add("greensboro")
         _health(conn, cfg, "greensboro", ok, err)
-    # Fingerprint of what we searched, so the differ can tell "this bottle just
-    # arrived" from "we just started looking for it" — see apply_board_snapshot.
-    coverage = hashlib.sha256("\n".join(sorted(terms)).encode()).hexdigest()[:16]
+    coverage = _coverage_fingerprint(terms)
     events = apply_board_snapshot(
         conn, all_rows, observed=observed,
         alertable=alertable_codes(conn, cfg.watch, all_rows), complete=complete,

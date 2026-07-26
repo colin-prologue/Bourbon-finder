@@ -1763,6 +1763,27 @@ def test_durham_will_not_call_an_unreadable_page_a_sellout(monkeypatch, detail, 
     ).fetchone()[0] == 3, "stale beats fabricated — the known quantity stands"
 
 
+def test_changing_durham_selection_widens_coverage(monkeypatch):
+    """The differ silences first sightings when coverage widened, and derives
+    "did coverage widen" from a fingerprint of the search terms. Durham's rule
+    for which matched codes earn a detail fetch is coverage too — changing it
+    from an arbitrary first-60 to a targeted 127 made six bottles that had sat
+    on those shelves for weeks announce themselves as fresh restocks, without
+    any term changing. The fingerprint has to see that axis."""
+    from ncbourbon.cli import _coverage_fingerprint
+    from ncbourbon.sources import durham
+
+    terms = ["eagle rare", "weller"]
+    before = _coverage_fingerprint(terms)
+    assert before == _coverage_fingerprint(list(reversed(terms))), "term order must not matter"
+
+    monkeypatch.setattr(durham, "SELECTION_POLICY", "tiered-v2")
+    assert _coverage_fingerprint(terms) != before, (
+        "a change to which codes get fetched must change the fingerprint, "
+        "or the next run reports newly-covered bottles as arrivals"
+    )
+
+
 def test_report_shows_a_partial_read_not_just_a_green_light(monkeypatch):
     """A capped source succeeds and looks healthy. `last_ok` cannot express
     'read 60 of 127', so the shortfall has to ride alongside it."""
