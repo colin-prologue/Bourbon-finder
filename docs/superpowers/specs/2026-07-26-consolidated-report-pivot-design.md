@@ -87,9 +87,12 @@ Uncle Nearest · Very Old · Weller (×6) · Widow Jane · Wild Turkey
 Willett Wheated · Woodford Reserve · Wyoming Whiskey · Yellowstone Small
 ```
 
-Weller is Allocation-flagged and had **never once been searched on any board**.
-A cap on an alphabetically sorted list is not sampling; it is a permanent blind
-spot at the end of the alphabet.
+Weller is Allocation-flagged and was **invisible to every board driven by
+`_watchlist_terms`** — Durham and Greensboro, the two largest in range. Wake has
+its own static `[wake] search_terms` which includes `weller`, so it was
+unaffected; the gap was two of three active boards, not all three. A cap on an
+alphabetically sorted list is not sampling; it is a permanent blind spot at the
+end of the alphabet.
 
 The four causes above make the tool unreadable. This one makes it quietly
 incomplete, which is worse: nothing about the output suggests a gap.
