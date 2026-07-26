@@ -296,9 +296,11 @@ function renderSources() {
   host.innerHTML = "";
   for (const s of DATA.sources) {
     const chip = document.createElement("span");
-    chip.className = "chip" + (s.stale ? " stale" : "");
+    chip.className = "chip" + (s.stale || s.note ? " stale" : "");
+    // textContent, never innerHTML: every value here is scraped.
     chip.textContent = `${s.source} · ${ago(s.last_ok)}` +
-      (s.failures ? ` · ${s.failures} failures` : "");
+      (s.failures ? ` · ${s.failures} failures` : "") +
+      (s.note ? ` · ${s.note}` : "");
     host.appendChild(chip);
   }
 }

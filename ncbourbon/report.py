@@ -87,6 +87,9 @@ class SourceStatus:
     last_error: str | None
     failures: int
     stale: bool
+    # Set when a source succeeded but did not read everything it could — a
+    # partial read looks identical to a complete one from `last_ok` alone.
+    note: str = ""
 
 
 @dataclass
@@ -330,6 +333,11 @@ def _sources(conn: sqlite3.Connection, boards: set[str]) -> list[SourceStatus]:
     which `poll-shipments` therefore records as failing on every run by design.
     Reporting those as needing attention is crying wolf about things working
     exactly as intended — and it buries the one case that matters.
+
+    A source can also succeed and still be incomplete: a board that caps its
+    per-run requests reads a subset, and `last_ok` cannot tell you that. Those
+    carry a `note` (see `source_coverage`), so a shortfall reaches the report
+    instead of living out its life in a log line.
     """
     expected = {"stocks", "catalog"} | boards
     rows = {
@@ -337,6 +345,7 @@ def _sources(conn: sqlite3.Connection, boards: set[str]) -> list[SourceStatus]:
         for r in conn.execute("SELECT * FROM health")
         if r["source"] in expected or r["source"].removeprefix("abcgo:") in expected
     }
+    coverage = {r["source"]: r for r in conn.execute("SELECT * FROM source_coverage")}
     # Build from `expected`, not from the health table. A source that has never
     # completed a poll has no health row at all, so iterating the table silently
     # omitted it — on a fresh install, or whenever poll-boards returns early
@@ -354,9 +363,25 @@ def _sources(conn: sqlite3.Connection, boards: set[str]) -> list[SourceStatus]:
                 last_error=r["last_error"] if r else None,
                 failures=(r["consecutive_failures"] or 0) if r else 0,
                 stale=age is None or age > limit,
+                # Keyed on `source`, not on the health row — a source with no
+                # health row at all still has coverage worth reporting, and
+                # `r` is None for exactly those.
+                note=_coverage_note(coverage.get(source)),
             )
         )
     return out
+
+
+def _coverage_note(row) -> str:
+    """Human-facing summary of a partial read; "" when the read was complete."""
+    if row is None:
+        return ""
+    fetched, relevant = row["fetched"] or 0, row["relevant"] or 0
+    if not row["classified"]:
+        return f"could not classify results — read all {fetched} unfiltered"
+    if fetched < relevant:
+        return f"partial coverage: read {fetched} of {relevant} relevant items"
+    return ""
 
 
 def build_report(conn: sqlite3.Connection, cfg: Config, window_hours: int = 24) -> Report:
@@ -471,12 +496,16 @@ def render_text(report: Report) -> str:
         lines.append(f"  {w.cases:>6}  {w.name} [{w.listing_type}]")
     lines.append("")
 
-    stale = [s for s in report.sources if s.stale or s.failures]
-    if stale:
+    # A source reading only part of what it could is worth the same attention as
+    # one that is stale or failing — it is just as wrong, and quieter about it.
+    attention = [s for s in report.sources if s.stale or s.failures or s.note]
+    if attention:
         lines.append("SOURCES NEEDING ATTENTION")
-        for s in stale:
+        for s in attention:
             lines.append(f"  {s.source}: last ok {s.last_ok or 'never'} "
                          f"({s.failures} consecutive failures)")
+            if s.note:
+                lines.append(f"    {s.note}")
         lines.append("")
     if report.suppressed:
         lines.append(f"{report.suppressed} alerts were dropped by the daily cap — "
