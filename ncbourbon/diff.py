@@ -219,13 +219,14 @@ def apply_board_snapshot(
         old = prev.get((r.board, r.plu, r.store))
         if r.qty > 0 and (old is None or old == 0):
             price = f", {r.price}" if r.price else ""
+            where = r.store_display or r.store  # stable key vs. human label
             events.append(
                 Event(
                     "board_restock",
                     f"{r.board}:{r.plu}:{r.store}",
                     f"[{r.board.upper()} ABC] On shelf: {r.name}",
                     f"{r.name} (NC {r.plu}{price})\n"
-                    f"{r.qty} on hand @ {r.store}\n"
+                    f"{r.qty} on hand @ {where}\n"
                     f"Live per-store confirmation via {r.board}.abcgo.app — "
                     "bottles can be pre-claimed by mixed-beverage accounts, so move fast.",
                 )

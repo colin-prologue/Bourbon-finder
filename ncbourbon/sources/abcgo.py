@@ -58,8 +58,15 @@ class BoardStoreStock:
     plu: str     # NC Code, dashless
     name: str
     price: str
-    store: str   # human-readable store address
+    store: str   # STABLE per-store key — part of the board_latest primary key
+                 # (board, plu, store). Must never change for a given physical
+                 # store, or diffing re-keys the row and mis-fires board_restock.
     qty: int     # on-hand at that store
+    store_display: str = ""  # human label for alerts; falls back to `store` when
+                             # empty. Lets a board carry a stable key AND a
+                             # prettier/enrichable name without re-keying (see
+                             # greensboro STORE_NAMES). ABC/GO & Durham leave this
+                             # empty — their `store` is already a real address.
 
 
 def _json_list(resp) -> list[dict]:
