@@ -33,26 +33,34 @@ All state lives in one SQLite file.
 
 ## Alert policy
 
-Three rules keep the volume honest. They exist because the first six days of
-production sent 5,994 emails, of which roughly 97% were noise.
+**Nothing about a bottle is emailed.** The board is the product: it is
+republished after every poll and shows current state, so mail that restates the
+page is noise by construction. The first six days of production sent 5,994
+emails, ~97% of them noise, and successive rounds of filtering kept shrinking
+the number without fixing the shape of the thing.
 
-- **Store everything, alert on little.** Every row a source returns is
-  persisted — the digest wants the whole inventory picture. Only codes in the
+The only instant mail is **a source that has failed `HEALTH_ALERT_THRESHOLD`
+(4) consecutive times**, because a board going quiet is the one fact the board
+itself cannot show you. A 6-hour cooldown stops a broken source nagging every
+poll. There is no daily cap: it existed only to bound product mail, exempted
+health, and so became unreachable once products stopped being mailed.
+
+Two rules still govern what the *report* treats as an event, and both matter
+for the page:
+
+- **Store everything, surface little.** Every row a source returns is
+  persisted — the report wants the whole inventory picture. Only codes in the
   watch universe (Allocation/Limited in the warehouse, plus the state's
-  official allocated list, plus `name_patterns` matches) produce an alert.
+  official allocated list, plus `name_patterns` matches) count as events.
   Board search APIs match loosely: a bourbon watchlist pulled back 285
   Greensboro codes, 28 of which were actually allocated.
-- **One alert per product, not per store.** A county delivery puts a bottle on
+- **One event per product, not per store.** A county delivery puts a bottle on
   a dozen shelves at once; that is one thing happening, and the stores belong
-  in the body. Per-store keys also defeated the 6-hour cooldown, which keys on
-  them. On the current data this alone takes 1,636 in-stock store rows down to
-  13 products.
+  in the detail. On the current data this takes 1,636 in-stock store rows down
+  to 13 products.
 - **Seeding is not news.** A source with no prior state has nothing to diff, so
   it is persisted silently. The first `poll-catalog` used to emit one email per
   pre-existing row — 4,186 of them.
-
-`max_daily_alerts` (default 25) is a backstop against a regression, not a
-policy. Health warnings are never capped.
 
 ## The report
 

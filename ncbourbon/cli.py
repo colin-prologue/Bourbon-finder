@@ -43,9 +43,15 @@ log = logging.getLogger("ncbourbon")
 HEALTH_ALERT_THRESHOLD = 4  # consecutive failures before we email about a broken source
 
 
-def _emit(conn, cfg, events):
-    for ev in events:
-        alert(conn, cfg.alerts, ev.kind, ev.key, ev.subject, ev.body)
+# Product events are no longer mailed. The board is the product: it is
+# republished after every poll and shows current state, so an email restating
+# what the page already says is pure noise — 5,994 of them in the first six
+# days. The appliers still compute events because they are how a poll reports
+# what changed in the log, and the transitions themselves live in board_stock
+# with prev_qty, which is a better record than an inbox.
+#
+# The one thing a board cannot tell you is that it stopped working, so `alert`
+# now has exactly one caller: `_health`, below. Everything else is pull.
 
 
 def _health(conn, cfg, source: str, ok: bool, error: str = ""):
@@ -69,7 +75,6 @@ def cmd_poll_stocks(conn, cfg, session):
         raise SystemExit(1)
     _health(conn, cfg, "stocks", True)
     events = apply_stock_snapshot(conn, rows, cfg.watch, report_date.isoformat())
-    _emit(conn, cfg, events)
     log.info("stocks: %d rows (report %s), %d events", len(rows), report_date, len(events))
 
 
@@ -255,7 +260,6 @@ def cmd_poll_boards(conn, cfg, session):
         alertable=alertable_codes(conn, cfg.watch, all_rows), complete=complete,
         coverage=coverage, covered=covered,
     )
-    _emit(conn, cfg, events)
     log.info("boards: %d store-rows across %d board(s), %d events",
              len(all_rows), len(cfg.boards.abcgo_boards), len(events))
 
@@ -313,20 +317,18 @@ def cmd_poll_catalog(conn, cfg, session):
                 (catalog_mod.ALLOCATED_XLSX_URL, sha, len(content), now_iso()),
             )
             conn.commit()
-            if prev:  # only alert on change, not first load
-                alert(
-                    conn, cfg.alerts, "catalog_new", f"xlsx:{sha[:12]}",
-                    "[NC] Official allocated/limited list updated",
-                    f"The state's Public Allocated and Limited Distribution List changed "
-                    f"({label}, {len(alloc_items)} items). New codes may follow in the "
-                    "warehouse feed soon.",
-                )
+            if prev:  # changed, not first load
+                # Not mailed. A new official list is a change the board already
+                # shows: its codes join the watch universe, the search terms
+                # regenerate from it on the next poll, and anything actually on
+                # a shelf appears on the page. Restore an alert here only if the
+                # list starts carrying something the board cannot surface.
+                log.info("allocated list changed (%s, %d items)", label, len(alloc_items))
     except Exception as exc:  # noqa: BLE001
         ok = False
         err = f"allocated_xlsx: {exc}"
         log.warning(err)
     _health(conn, cfg, "catalog", ok, err)
-    _emit(conn, cfg, events)
     log.info("catalog: %d items ingested, %d events", len(items), len(events))
 
 
@@ -357,7 +359,6 @@ def cmd_poll_wake(conn, cfg, session):
             "\n".join(sorted(cfg.wake.search_terms)).encode()
         ).hexdigest()[:16],
     )
-    _emit(conn, cfg, events)
     log.info("wake: %d store-rows, %d events", len(seen), len(events))
 
 
