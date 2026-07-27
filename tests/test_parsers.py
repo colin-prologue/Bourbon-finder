@@ -1504,6 +1504,14 @@ def test_apply_board_snapshot_absence_outside_scope_does_not_zero():
 
 # --- Durham board adapter (added 2026-07-22) --------------------------------
 
+# The availability cells below are copied from a live durhamabc.com product
+# page (code 17345, fetched 2026-07-27), NOT hand-written. The count sits in
+# its own <span> inside a badge — `In Stock (<span>2</span>)` — and the cell is
+# read with get_text(" "), so it arrives as "In Stock ( 2 )". The original
+# fixture wrote the plain `In Stock (2)` this file's author expected, which is
+# a form the site never emits; the parser's regex demanded that same flush
+# form, so fixture and parser shared one wrong idea of Durham and the test
+# passed while every real quantity read 0. Keep this markup verbatim.
 _DURHAM_DETAIL = """
 <html><body>
   <h1>E.H. TAYLOR JR. SMALL BATCH</h1>
@@ -1511,8 +1519,18 @@ _DURHAM_DETAIL = """
   <div>PLU 20581 &middot; .75L $54.95</div>
   <table>
     <tr><th>Store</th><th>Address</th><th>Phone</th><th>Hours</th><th>Availability</th><th>Directions</th></tr>
-    <tr><td>#1 Store #1</td><td>1928 Holloway Street Durham, NC 27703</td><td>(919) 682-4943</td><td>Mon-Sat 9am-9pm</td><td>In Stock (2)</td><td>Get Directions</td></tr>
-    <tr><td>#3 Store #3</td><td>2806 Hillsborough Road Durham, NC 27705</td><td>(919) 286-2525</td><td>Mon-Sat 9am-9pm</td><td>Out of Stock</td><td>Get Directions</td></tr>
+    <tr><td>#1 Store #1</td><td>1928 Holloway Street Durham, NC 27703</td><td>(919) 682-4943</td><td>Mon-Sat 9am-9pm</td><td>
+        <span class="inline-flex items-center whitespace-nowrap px-2.5 py-0.5 text-xs font-medium rounded-full
+                     bg-green-100 text-green-800">
+            In Stock (<span>2</span>)
+        </span>
+    </td><td>Get Directions</td></tr>
+    <tr><td>#3 Store #3</td><td>2806 Hillsborough Road Durham, NC 27705</td><td>(919) 286-2525</td><td>Mon-Sat 9am-9pm</td><td>
+        <span class="inline-flex items-center whitespace-nowrap px-2.5 py-0.5 text-xs font-medium rounded-full
+                     bg-red-100 text-red-800">
+            Out of Stock
+        </span>
+    </td><td>Get Directions</td></tr>
   </table>
 </body></html>
 """
@@ -1544,9 +1562,34 @@ def test_durham_parse_product():
     assert info["price"] == "$54.95"
     assert info["category"] == "Limited / Allocated"
     assert info["stores"] == [
-        ("1928 Holloway Street Durham, NC 27703", 2),
+        ("1928 Holloway Street Durham, NC 27703", 2),   # nested <span> count
         ("2806 Hillsborough Road Durham, NC 27705", 0),  # Out of Stock -> 0
     ]
+
+
+def test_durham_quantity_survives_nesting_and_spacing():
+    """A qty that reads 0 is indistinguishable from a real sellout downstream.
+
+    Durham shipped for five days reporting an empty shelf board-wide because
+    the only in-stock form the parser accepted was one the site never sends.
+    Pin every spacing variant so a markup tweak fails loudly here instead of
+    silently flattening the board to zero again.
+    """
+    from ncbourbon.sources.durham import parse_product
+
+    def cell(markup: str) -> int:
+        html = (
+            "<table><tr><th>Store</th><th>Address</th><th>Availability</th></tr>"
+            f"<tr><td>s</td><td>1 Main St</td><td>{markup}</td></tr></table>"
+        )
+        return parse_product(html)["stores"][0][1]
+
+    assert cell("In Stock (<span>6</span>)") == 6      # the live shape
+    assert cell("In Stock (6)") == 6                   # flat, still accepted
+    assert cell("In Stock ( 6 )") == 6                 # what get_text produces
+    assert cell("<span>In Stock (<b>12</b>)</span>") == 12   # deeper nesting
+    assert cell("Out of Stock") == 0
+    assert cell("<span>Out of Stock</span>") == 0
 
 
 def test_durham_fetch_end_to_end(monkeypatch):
