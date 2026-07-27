@@ -14,6 +14,18 @@
 # 2026-07-24 and poll-catalog 2026-07-22 while the workflow reported success
 # every 20 minutes.
 #
+# NOTE ON CADENCE: Actions throttles frequent schedules on public repos. At
+# `*/20` (72 nominal fires/day) only ~20 were delivered, in gaps of up to 3.5h
+# — and every cron on the workflow shares that pressure, so the once-a-day
+# digest was competing with a loop asking for 72 slots and being refused.
+# The warehouse loop is now 2-hourly: drawdown is a trend signal, not a
+# minute-by-minute one, and it also halves the DB commits that are the repo's
+# growth. Boards get a fourth slot because the loop is idempotent and a
+# redundant fire is cheaper than an 8-hour hole. Slower cadence raises the
+# cost of each dropped fire, so if delivery is still lossy the next step is a
+# staleness catch-up (run boards on a stocks tick when health.last_ok is old),
+# NOT a return to reading the clock to decide what runs.
+#
 # Secrets to set (repo Settings -> Secrets and variables -> Actions):
 #   NCBOURBON_SMTP_PASSWORD  — SMTP/App password for the alert mailbox
 #   NCBOURBON_SUBSCRIBERS    — optional JSON list of people who get the daily
@@ -23,9 +35,9 @@
 name: poll
 on:
   schedule:
-    - cron: "*/20 * * * *"       # warehouse differ
-    - cron: "13 10,15,20 * * *"  # boards + wake, 3x/day
-    - cron: "7 9 * * *"          # catalog + digest + prune, daily ~5am ET
+    - cron: "17 */2 * * *"          # warehouse differ, every 2h
+    - cron: "13 9,13,17,21 * * *"   # boards + wake, 4 slots/day
+    - cron: "7 9 * * *"             # catalog + digest + prune, daily ~5am ET
   workflow_dispatch:
     inputs:
       loops:
@@ -63,10 +75,14 @@ jobs:
         run: |
           set -euo pipefail
           stocks=false; boards=false; daily=false
+          # These must stay byte-identical to the `cron:` strings above — the
+          # match is literal (the quotes stop `*` globbing), so a cron edited
+          # without its arm silently selects no loops and the run still
+          # reports success. Same silence as the clock bug, different cause.
           case "$SCHEDULE" in
-            "*/20 * * * *")      stocks=true ;;
-            "13 10,15,20 * * *") boards=true ;;
-            "7 9 * * *")         daily=true ;;
+            "17 */2 * * *")        stocks=true ;;
+            "13 9,13,17,21 * * *") boards=true ;;
+            "7 9 * * *")           daily=true ;;
           esac
           case "${DISPATCH:-}" in
             stocks) stocks=true ;;
@@ -117,7 +133,13 @@ jobs:
           python -m ncbourbon digest
           python -m ncbourbon prune
 
+      # Runs even when a loop above failed. Every failure so far has been an
+      # upstream read timeout on abc2.nc.gov, and the default success() gate
+      # meant one slow state server threw away everything the run had already
+      # collected — including the health row recording the failure. SQLite
+      # commits per loop, so what lands is consistent, just partial.
       - name: Commit DB state
+        if: always()
         run: |
           git config user.name "ncbourbon-bot"
           git config user.email "actions@users.noreply.github.com"
