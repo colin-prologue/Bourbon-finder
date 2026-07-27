@@ -42,7 +42,13 @@ log = logging.getLogger(__name__)
 BASE = "https://durhamabc.com"
 BOARD = "durham"
 PRODUCT_HREF_RE = re.compile(r"/products/(\d+)")
-IN_STOCK_RE = re.compile(r"In Stock\s*\((\d+)\)", re.I)
+# Durham wraps the count in its own element — `In Stock (<span>6</span>)` — and
+# the cell is read with get_text(" "), which puts a separator between text
+# nodes and yields "In Stock ( 6 )". The original pattern required the digits
+# flush against both parens, so it never matched and every store fell through
+# to qty=0: Durham reported an empty shelf from the day the adapter shipped and
+# could never fire a 0 -> >0 restock. Tolerate whitespace inside the parens.
+IN_STOCK_RE = re.compile(r"In Stock\s*\(\s*(\d+)\s*\)", re.I)
 PRICE_RE = re.compile(r"\$\s?([\d,]+\.\d{2})")
 # Durham's own badge for the bottles this tool exists to catch. Matches
 # "Limited / Allocated", "Allocated", "Limited".
