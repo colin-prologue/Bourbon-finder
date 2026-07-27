@@ -668,61 +668,64 @@ def test_board_search_terms_cover_the_whole_watch_universe():
     assert len([t for t in _watchlist_terms(conn, WatchConfig()) if t.startswith("Zbrand")]) == 200
 
 
-def test_daily_alert_cap_never_gags_health_warnings(monkeypatch):
+def test_a_board_restock_sends_no_mail(monkeypatch):
+    """Product events are the board's job, not the inbox's.
+
+    A poll that puts bottles on shelves must send nothing. This replaces the
+    daily-cap tests: the cap existed only to bound product mail, and bounding
+    noise is a weaker guarantee than not generating it. Guards against `_emit`
+    or any per-event `alert()` call being reintroduced.
+    """
     from ncbourbon import alerts as alerts_mod
-    from ncbourbon.alerts import alert
-    from ncbourbon.config import AlertConfig
+    from ncbourbon import cli
+    from ncbourbon.config import Config
     from ncbourbon.db import connect
+    from ncbourbon.diff import apply_board_snapshot
+    from ncbourbon.sources.abcgo import BoardStoreStock
 
-    monkeypatch.setattr(alerts_mod, "send_email", lambda cfg, subject, body: True)
-    conn = connect(":memory:")
-    cfg = AlertConfig(max_daily_alerts=3, cooldown_hours=0)
-    for i in range(6):
-        alert(conn, cfg, "board_restock", f"k{i}", f"subject {i}", "body")
-    sent = conn.execute(
-        "SELECT COUNT(*) FROM alert_log WHERE kind='board_restock'"
-    ).fetchone()[0]
-    capped = conn.execute(
-        "SELECT COUNT(*) FROM alert_log WHERE kind='capped:board_restock'"
-    ).fetchone()[0]
-    assert (sent, capped) == (3, 3)
-    # The scraper-is-broken alert still gets through a spent budget.
-    alert(conn, cfg, "health", "stocks", "source failing", "body")
-    assert conn.execute("SELECT COUNT(*) FROM alert_log WHERE kind='health'").fetchone()[0] == 1
+    import ncbourbon.sources.abcgo as abcgo
 
-
-def test_undelivered_alerts_do_not_consume_the_daily_cap(monkeypatch):
-    """An SMTP outage must not burn the day's budget. alert() logs a row even
-    when the send fails, so counting rows rather than deliveries meant a failing
-    mail server could silently suppress every real alert for the next 24h —
-    after service came back."""
-    from ncbourbon import alerts as alerts_mod
-    from ncbourbon.alerts import alert
-    from ncbourbon.config import AlertConfig
-    from ncbourbon.db import connect
+    sent: list[str] = []
+    monkeypatch.setattr(alerts_mod, "send_email",
+                        lambda cfg, subject, body: sent.append(subject) or True)
 
     conn = connect(":memory:")
-    cfg = AlertConfig(max_daily_alerts=3, cooldown_hours=0)
+    cfg = Config()
+    cfg.boards.abcgo_boards = ["nh"]; cfg.boards.durham = False; cfg.boards.greensboro = False
+    cfg.boards.search_terms = ["buffalo"]
+    conn.execute("INSERT INTO allocated_list (nc_code, product) VALUES ('20624','BUFFALO TRACE')")
 
-    monkeypatch.setattr(alerts_mod, "send_email", lambda cfg, subject, body: False)
-    for i in range(5):
-        alert(conn, cfg, "board_restock", f"outage{i}", f"subject {i}", "body")
-    assert conn.execute(
-        "SELECT COUNT(*) FROM alert_log WHERE kind LIKE 'capped:%'"
-    ).fetchone()[0] == 0                      # nothing capped: nothing was delivered
+    # Seen at zero first, so the next poll is a genuine 0 -> 6 restock.
+    STORE = "6 Market St Wilmington NC 28401"   # == abcgo._fmt_store of the details row below
+    apply_board_snapshot(conn, [BoardStoreStock("nh", "20624", "Buffalo Trace", "22.95", STORE, 0)],
+                         observed={("nh", "20624")}, complete={"nh"})
 
-    # SMTP recovers — the full budget is still available.
-    monkeypatch.setattr(alerts_mod, "send_email", lambda cfg, subject, body: True)
-    for i in range(3):
-        alert(conn, cfg, "board_restock", f"ok{i}", f"subject {i}", "body")
+    class _Resp:
+        def __init__(self, payload): self._p, self.status_code = payload, 200
+        def json(self): return self._p
+
+    def fake_fetch(session, method, url, *, timeout=60, data=None, json=None, headers=None):
+        if url.endswith("/api/inventory/search"):
+            return _Resp([{"Code": "20624", "Brand": "Buffalo Trace", "Retail": "22.95",
+                           "OnHand": 6, "Stores": 1}])
+        return _Resp([{"StoreId": 1, "Address1": "6 Market St", "City": "Wilmington",
+                       "State": "NC", "Zip": "28401", "OnHand": 6}])
+    monkeypatch.setattr(abcgo, "fetch", fake_fetch)
+
+    # The whole command, not just the applier — reintroducing an `_emit` step
+    # inside cmd_poll_boards is exactly the regression this guards.
+    cli.cmd_poll_boards(conn, cfg, object())
+
     assert conn.execute(
-        "SELECT COUNT(*) FROM alert_log WHERE message LIKE '[sent]%'"
-    ).fetchone()[0] == 3
-    # ...and only now does the cap bind.
-    alert(conn, cfg, "board_restock", "over", "one too many", "body")
-    assert conn.execute(
-        "SELECT COUNT(*) FROM alert_log WHERE kind='capped:board_restock'"
-    ).fetchone()[0] == 1
+        "SELECT qty FROM board_latest WHERE board='nh' AND plu='20624'"
+    ).fetchone()["qty"] == 6, "the restock should still be recorded"
+    assert sent == [], f"a restock must not be mailed, got {sent}"
+    assert conn.execute("SELECT COUNT(*) FROM alert_log").fetchone()[0] == 0
+
+    # A broken source is the one thing the board cannot show you.
+    for _ in range(cli.HEALTH_ALERT_THRESHOLD):
+        cli._health(conn, cfg, "nh", False, "boom")
+    assert len(sent) == 1 and "source failing" in sent[0]
 def _report_fixture_db():
     """A DB with one watched product on two shelves, one unwatched product,
     and one product on an out-of-range board."""
@@ -1017,7 +1020,7 @@ def test_warehouse_increases_are_not_labelled_as_boards_ordering():
 
     report = Report(
         generated_at="2026-07-26T00:00:00Z", window_hours=24, shelf=[], changes=[],
-        sources=[], suppressed=0,
+        sources=[],
         warehouse=[
             WarehouseItem("1", "Falling Bourbon", "Allocation", 5, -20, "2026-07-26"),
             WarehouseItem("2", "Rising Bourbon", "Allocation", 90, +30, "2026-07-26"),
@@ -1386,7 +1389,6 @@ def test_abcgo_search_ok_details_403_does_not_zero(monkeypatch):
     cfg = Config()
     cfg.boards.abcgo_boards = ["nh"]; cfg.boards.durham = False; cfg.boards.greensboro = False
     cfg.boards.search_terms = ["buffalo"]
-    monkeypatch.setattr(cli, "_emit", lambda *a, **k: None)
     monkeypatch.setattr(cli, "_health", lambda *a, **k: None)
     # Previously in stock.
     apply_board_snapshot(conn, [BoardStoreStock("nh", "20624", "Buffalo Trace", "22.95", "6 Market St", 5)],

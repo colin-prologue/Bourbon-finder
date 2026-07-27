@@ -100,7 +100,6 @@ class Report:
     warehouse: list[WarehouseItem]
     changes: list[Change]
     sources: list[SourceStatus]
-    suppressed: int     # alerts dropped by the daily cap in the window
 
 
 def _hours_since(iso: str | None) -> float | None:
@@ -398,10 +397,6 @@ def build_report(conn: sqlite3.Connection, cfg: Config, window_hours: int = 24) 
     # from every surface that reads the database.
     codes = watch_codes(conn, cfg.watch) | pattern_matched_codes(conn, cfg.watch)
     boards = active_boards(cfg)
-    suppressed = conn.execute(
-        "SELECT COUNT(*) FROM alert_log WHERE kind LIKE 'capped:%' AND sent_at > ?",
-        (_since_iso(window_hours),),
-    ).fetchone()[0]
     return Report(
         generated_at=now_iso(),
         window_hours=window_hours,
@@ -409,7 +404,6 @@ def build_report(conn: sqlite3.Connection, cfg: Config, window_hours: int = 24) 
         warehouse=_warehouse(conn, cfg.watch, codes),
         changes=_changes(conn, codes, boards, window_hours),
         sources=_sources(conn, boards),
-        suppressed=suppressed,
     )
 
 
@@ -514,10 +508,6 @@ def render_text(report: Report) -> str:
                          f"({s.failures} consecutive failures)")
             if s.note:
                 lines.append(f"    {s.note}")
-        lines.append("")
-    if report.suppressed:
-        lines.append(f"{report.suppressed} alerts were dropped by the daily cap — "
-                     "something upstream is noisier than it should be.")
         lines.append("")
 
     lines.append("* = on the state's official allocated/limited list.")
