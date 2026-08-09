@@ -68,8 +68,12 @@ jobs:
       cancel-in-progress: false
     outputs:
       # Whether an artifact actually landed — not merely whether we meant to
-      # publish. `deploy` has nothing to do without one.
-      deployable: ${{ steps.render.outcome == 'success' }}
+      # publish, and not merely whether the render worked. `deploy` has nothing
+      # to do without one, and `deploy-pages` reports its absence as an opaque
+      # failure two jobs from the cause. Keyed on the UPLOAD, because rendering
+      # successfully and then failing to upload is a real path: artifact upload
+      # is a network operation of its own.
+      deployable: ${{ steps.upload.outcome == 'success' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -175,6 +179,7 @@ jobs:
       # hand `deploy` a missing artifact and turn a clear "render-site failed"
       # into an opaque one two jobs later.
       - uses: actions/upload-pages-artifact@v3
+        id: upload
         if: ${{ !cancelled() && steps.render.outcome == 'success' }}
         with:
           path: site
