@@ -151,6 +151,7 @@ jobs:
       # collected — including the health row recording the failure. SQLite
       # commits per loop, so what lands is consistent, just partial.
       - name: Commit DB state
+        id: commit
         if: always()
         run: |
           git config user.name "ncbourbon-bot"
@@ -159,20 +160,26 @@ jobs:
           git diff --cached --quiet || git commit -m "db: poll $(date -u +%FT%TZ)"
           git push
 
-      # `!cancelled()`, not the default success() gate, for the same reason
-      # "Commit DB state" above runs on always(): a loop failing does not make
-      # the rest of the run worthless. Every poll failure so far has been a read
-      # timeout on abc2.nc.gov that recovered on the next tick, and under
-      # success() one of those took the *page* down for the cycle too — the site
-      # kept serving an eight-hour-old copy because a sixty-second hiccup had
-      # skipped the render. The page is built from whatever the DB holds, and it
-      # already tells the truth about staleness: `render-site` stamps
-      # generated_at, and the per-source freshness chips come from
-      # health.last_ok, so a stocks failure shows up as a red `stocks` chip
-      # rather than as a silently frozen page.
+      # Not the default success() gate, for the same reason "Commit DB state"
+      # above runs on always(): a loop failing does not make the rest of the run
+      # worthless. Every poll failure so far has been a read timeout on
+      # abc2.nc.gov that recovered on the next tick, and under success() one of
+      # those took the *page* down for the cycle too — the site kept serving an
+      # eight-hour-old copy because a sixty-second hiccup had skipped the render.
+      # A partial read is honest here: `render-site` stamps generated_at and the
+      # per-source freshness chips come from health.last_ok, so a stocks failure
+      # shows as a red `stocks` chip rather than as a silently frozen page.
+      #
+      # A failed COMMIT is the different case, and it does block. The page is a
+      # view of the DB, and an unpushed DB is one the next run will never see:
+      # it checks out the older file and re-derives from there, so a page built
+      # on the discarded state would show history that then rolls back. Publish
+      # only what is durable. The two conditions are not the same thing wearing
+      # different hats — one is incomplete data, honestly labelled; the other is
+      # data the system is about to forget.
       - name: Render site
         id: render
-        if: ${{ !cancelled() && steps.which.outputs.publish == 'true' }}
+        if: ${{ !cancelled() && steps.commit.outcome == 'success' && steps.which.outputs.publish == 'true' }}
         run: python -m ncbourbon render-site --out site
 
       # Gated on the render, not on `publish`. Uploading unconditionally would
