@@ -22,7 +22,6 @@ stages:
 | `poll-boards` | Per-store board sites: Durham + Greensboro (in range of Hillsborough) | 2–4×/day | **Stage B (confirmation):** which shelf a rare bottle is on right now — emits `board_restock` |
 | `poll-wake` | Wake ABC store search (`wakeabc.com`) | 2–4×/day | store-level Wake restocks with addresses and quantities (separate legacy Wake path) |
 | `poll-catalog` | Special Items, New Items, allocated-list xlsx | daily | new NC Codes entering the system (~1 month early) |
-| `poll-shipments` | *deprecated* — StockShipped was retired by NC ABC (2026-07) | — | liveness ping only; warns loudly if the state ever restores the feed |
 
 Stage A is the radar (what rare bottle is in the state and moving); Stage B
 is confirmation (which store shelf it's on now). There is **no** advance
@@ -208,8 +207,12 @@ good citizen — the defaults already are:
 - **StockShipped was retired by NC ABC** (2026-07) — it was the only
   statewide warehouse→board shipment feed, so there is no advance
   "which county gets it" signal anymore; the board leg (`poll-boards`)
-  confirms shelf presence instead of predicting it. `poll-shipments` is
-  kept only as a cheap liveness ping that warns if the feed ever returns.
+  confirms shelf presence instead of predicting it. A `poll-shipments`
+  liveness ping survived for a few weeks and was removed in 2026-08: it
+  cost a request on every board poll and held a health row at 57
+  consecutive failures by design, which is a permanently lit warning light
+  on a working system. The parser is in git history; check the feed by hand
+  if you ever suspect it is back.
 - NC ABC error pages come back **HTTP 200**; parsers detect them by title.
   Board sites can also serve a 403 (WAF) to datacenter IPs. A blocked
   response yields no usable rows, and the ABC/GO sellout re-check only zeros

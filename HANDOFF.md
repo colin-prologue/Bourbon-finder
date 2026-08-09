@@ -54,7 +54,7 @@ needs to continue is here or in the repo. (Deeper research lives in the claude.a
 - Run tests: `python -m pytest tests/ -q`
 - Recon is easy from this machine: the NC ABC + board sites are public and your IP is not blocked, so just `curl`/`requests` them directly. (A prior cloud session had to drive a browser because its sandbox egress was firewalled — you don't have that limitation.)
 - Run a loop: `python -m ncbourbon poll-boards` (needs `config.toml`; copy from `config.example.toml`, set SMTP via `NCBOURBON_SMTP_PASSWORD`).
-- `poll-shipments` is a deprecated liveness ping (StockShipped retired); don't build on it. The README loop table reflects the current `poll-boards`-based two-stage model.
+- The README loop table reflects the current `poll-boards`-based two-stage model.
 - Housekeeping: a `_to_delete/` folder holds stale `.git/index.lock` files left by a cloud session that couldn't delete files; safe to remove. `ncbourbon.db` is a local state DB (gitignored data, not code).
 
 ## Architecture (two-stage alerting)
@@ -62,7 +62,7 @@ The pipeline is: supplier → Raleigh state warehouse → local board → store 
 - **Stage A — `poll-stocks`** (every 15–20 min): the statewide warehouse report. Detects Allocation/Limited items arriving in the warehouse and drawdowns (boards ordering). This is the RADAR + watchlist source. Answers "what rare bottle is in the state, and is it moving."
 - **Stage B — `poll-boards`** (2–4×/day): per-store inventory across individual board sites. Answers "which shelf is it on right now." Emits `board_restock` alerts.
 - Other loops: `poll-catalog` (daily; new NC codes / allocated xlsx), `poll-wake` (legacy standalone Wake path — still present), `digest`, `status`, `backfill`, `history`.
-- `poll-shipments` is DEPRECATED: StockShipped is retired. It's now a cheap liveness ping that records health and warns loudly if the state ever restores the feed. Do not build on it.
+- `poll-shipments` and the whole shipment leg (`apply_shipments`, the `shipments` table, `[boards] watch_boards`, `sources/stock_shipped.py`) were REMOVED in 2026-08. StockShipped is retired; the liveness ping that replaced it cost a request per board poll and pinned a health row at 57 consecutive failures forever. Parser and tests are in git history. Do not rebuild it speculatively — check the feed by hand first.
 
 ### Data model
 - `sources/*.py` — one module per source. Board adapters return `abcgo.BoardStoreStock(board, plu, name, price, store, qty)`.

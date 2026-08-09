@@ -45,7 +45,6 @@ class WakeConfig:
 
 @dataclass
 class BoardsConfig:
-    watch_boards: list[str] = field(default_factory=list)  # legacy: StockShipped (retired 2026-07)
     # ABC/GO board subdomains to poll (e.g. "nh" = New Hanover / Wilmington).
     # Off by default: the only live ABC/GO board (New Hanover) is ~2.5h from
     # Hillsborough — out of practical driving range, so it's back-burnered like
@@ -144,7 +143,6 @@ def load_config(path: str | None = None) -> Config:
     )
     b = data.get("boards", {})
     cfg.boards = BoardsConfig(
-        watch_boards=list(b.get("watch_boards", [])),
         abcgo_boards=list(b.get("abcgo_boards", [])),
         search_terms=list(b.get("search_terms", [])),
         durham=b.get("durham", True),

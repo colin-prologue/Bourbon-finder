@@ -327,11 +327,11 @@ def _changes(conn: sqlite3.Connection, codes: set[str], boards: set[str], hours:
 def _sources(conn: sqlite3.Connection, boards: set[str]) -> list[SourceStatus]:
     """Freshness for the loops that are supposed to be running.
 
-    `health` accumulates a row for every source ever polled. That includes
-    boards since turned off, and `stock_shipped`, which the state retired and
-    which `poll-shipments` therefore records as failing on every run by design.
-    Reporting those as needing attention is crying wolf about things working
-    exactly as intended — and it buries the one case that matters.
+    `health` accumulates a row for every source ever polled, including boards
+    since turned off — New Hanover's row still says it last succeeded in July,
+    because that is when it was last enabled. Reporting those as needing
+    attention is crying wolf about things working exactly as intended, and it
+    buries the one case that matters.
 
     A source can also succeed and still be incomplete: a board that caps its
     per-run requests reads a subset, and `last_ok` cannot tell you that. Those

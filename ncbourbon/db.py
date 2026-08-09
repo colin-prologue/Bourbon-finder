@@ -39,14 +39,6 @@ CREATE TABLE IF NOT EXISTS catalog (
   retail_price TEXT,
   first_seen TEXT
 );
-CREATE TABLE IF NOT EXISTS shipments (
-  board TEXT NOT NULL,
-  nc_code TEXT NOT NULL,
-  product TEXT,
-  bottles INTEGER,
-  observed_at TEXT NOT NULL,
-  PRIMARY KEY (board, nc_code, observed_at)
-);
 CREATE TABLE IF NOT EXISTS wake_stock (
   plu TEXT NOT NULL,
   name TEXT,
@@ -161,6 +153,17 @@ def _migrate(conn: sqlite3.Connection) -> None:
     one database, it lives on one machine (plus the copy in CI), and a
     version table would be more moving parts than the thing it versions.
     """
+    # The shipment leg is gone (see the note above `_watchlist_terms` in
+    # cli.py). Its table never held a row — StockShipped was retired before the
+    # differ shipped — and its health row sat at 57 consecutive failures by
+    # design, which is a permanently lit warning light on a healthy system.
+    # Both are dropped rather than left as inert clutter, because the next
+    # person reading this schema would reasonably assume `shipments` gets
+    # written to.
+    conn.execute("DROP TABLE IF EXISTS shipments")
+    conn.execute("DELETE FROM health WHERE source='stock_shipped'")
+    conn.commit()
+
     # wake_latest gained `price` so a price-only change is still observable.
     # History now records changes rather than re-readings, and quantity alone
     # was the comparison — so a repriced bottle at an unchanged quantity wrote
