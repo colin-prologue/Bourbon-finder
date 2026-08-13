@@ -56,12 +56,21 @@ ALLOCATED_BADGE_RE = re.compile(r"allocat|limited", re.I)
 # Durham's empty-state text. A search that legitimately matched nothing says
 # so; a blocked or broken one just has no cards. See `search_cards`.
 NO_RESULTS_MARKER = "No products found"
-# Safety ceiling on per-run detail requests. Sized ~1.2x the live
-# allocated population (127 of 295 matches, measured 2026-07-26) so it does
-# not bind in normal operation — it is a runaway guard, not a coverage
-# policy. When it does bind, `Coverage.fetched < relevant` says so in the
-# report rather than only in the log.
-MAX_DETAIL_FETCHES = 150
+# Safety ceiling on per-run detail requests: a runaway guard, NOT a coverage
+# policy. The distinction is the whole point, and the first sizing lost it —
+# 150 was ~1.2x the then-live relevant population (127, measured 2026-07-26),
+# which meant it started binding the moment that population grew. By 2026-08-08
+# `relevant` was 207, so every single run silently skipped 57 codes while the
+# report printed "partial coverage: read 150 of 207" as a permanent state. A
+# warning that is always on is a warning that is off.
+#
+# Sized well clear of the live figure instead, so growth in the allocated list
+# cannot quietly turn it back into a policy. It costs nothing until something
+# has actually gone wrong: the loop only ever fetches `len(wanted)`, so the
+# ceiling is not a request budget. If `relevant` ever approaches this, that is
+# the signal to fix the term list (see `_watchlist_terms`), not to raise the
+# number again.
+MAX_DETAIL_FETCHES = 400
 REQUEST_DELAY_SECONDS = 0.3  # `http.fetch` has no throttle of its own
 
 

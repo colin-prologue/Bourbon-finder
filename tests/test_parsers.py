@@ -195,6 +195,47 @@ def test_migration_collapses_legacy_intraday_rows(tmp_path):
     assert conn2.execute("SELECT COUNT(*) FROM warehouse_snapshot").fetchone()[0] == 2
 
 
+def test_migration_drops_the_retired_shipment_leg(tmp_path):
+    """The StockShipped leg leaves nothing behind on an existing DB.
+
+    Both artefacts are actively misleading rather than merely inert: an empty
+    `shipments` table reads as a feed that is simply quiet, and the
+    `stock_shipped` health row sat at 57 consecutive failures BY DESIGN — a
+    permanently lit warning light, which is how a health table stops being read.
+    """
+    import sqlite3
+
+    path = str(tmp_path / "legacy.db")
+    raw = sqlite3.connect(path)
+    raw.executescript(
+        """
+        CREATE TABLE shipments (
+          board TEXT NOT NULL, nc_code TEXT NOT NULL, product TEXT,
+          bottles INTEGER, observed_at TEXT NOT NULL,
+          PRIMARY KEY (board, nc_code, observed_at)
+        );
+        CREATE TABLE health (
+          source TEXT PRIMARY KEY, last_ok TEXT, last_error TEXT,
+          consecutive_failures INTEGER DEFAULT 0
+        );
+        INSERT INTO health VALUES ('stock_shipped', NULL, 'retired', 57);
+        INSERT INTO health VALUES ('stocks', '2026-08-08T22:47:49Z', NULL, 0);
+        """
+    )
+    raw.commit()
+    raw.close()
+
+    conn = connect(path)
+    assert not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='shipments'"
+    ).fetchone()
+    sources = {r["source"] for r in conn.execute("SELECT source FROM health")}
+    assert sources == {"stocks"}        # the working source is untouched
+    # Idempotent, and it must not re-create the table on a DB that never had it.
+    conn.close()
+    assert connect(path).execute("SELECT COUNT(*) FROM health").fetchone()[0] == 1
+
+
 def test_wake_price_change_is_not_lost_when_quantity_holds(monkeypatch):
     """History records changes, not re-readings — but a repriced bottle at an
     unchanged quantity is a change, and wake_latest is the only other place the
@@ -1065,19 +1106,21 @@ def test_report_flags_a_stale_source():
     record_health(conn, "greensboro", True)
     conn.commit()
 
-    # A retired probe and a disabled board are not "needing attention" — health
-    # keeps a row for every source ever polled.
-    record_health(conn, "stock_shipped", False, "retired by the state")
+    # A board you have turned off is not "needing attention" — health keeps a
+    # row for every source ever polled. Both naming shapes have to be filtered:
+    # plain (`durham`) and the ABC/GO prefix (`abcgo:nh`).
+    record_health(conn, "durham", True)
     record_health(conn, "abcgo:nh", True)
     conn.commit()
 
     cfg = Config()
     cfg.boards.abcgo_boards = []                        # New Hanover is off
+    cfg.boards.durham = False                           # so is Durham
     cfg.wake.enabled = False
     sources = {s.source: s for s in build_report(conn, cfg).sources}
     assert sources["stocks"].stale                      # last ok in 2020
     assert not sources["greensboro"].stale              # just now
-    assert "stock_shipped" not in sources               # retired by design
+    assert "durham" not in sources                      # board deliberately off
     assert "nh" not in sources                          # board deliberately off
     # An enabled source that has NEVER polled has no health row at all. Listing
     # only existing rows hid it, so a fresh install reported nothing wrong while
@@ -1294,22 +1337,10 @@ def test_nc_today_timezone():
     assert nc_today() in (utc_now.date(), utc_now.date() - timedelta(days=1))
 
 
-def test_parse_shipments():
-    """StockShipped parser vs. the schema verified live on 2026-07-21.
-    The endpoint has been erroring since that evening; this pins the parser
-    so it works the moment the state fixes the page."""
-    from ncbourbon.sources.stock_shipped import parse_shipments
-    rows = parse_shipments((FIXTURES / "stockshipped_sample.html").read_text())
-    assert len(rows) == 3
-    wake = next(r for r in rows if "Wake" in r.board)
-    assert wake.nc_code == "27090" and wake.bottles == 72
-    titos = next(r for r in rows if r.nc_code == "00504")
-    assert titos.bottles == 1440  # comma-formatted numbers parse
-
-
-def test_parse_shipments_error_page_soft():
-    from ncbourbon.sources.stock_shipped import parse_shipments
-    assert parse_shipments((FIXTURES / "error_page.html").read_text()) == []
+# The StockShipped parser tests lived here. The feed was retired by NC ABC in
+# 2026-07 and the whole leg was removed in 2026-08 — see the note above
+# `_watchlist_terms` in cli.py. Both parser and tests are in git history if the
+# state ever restores it.
 
 
 # --- ABC/GO board leg (added 2026-07-22) -----------------------------------

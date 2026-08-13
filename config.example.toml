@@ -35,9 +35,6 @@ enabled = true
 search_terms = ["blanton", "weller", "eh taylor", "eagle rare", "stagg", "van winkle", "old fitzgerald", "elmer", "michter", "elijah craig barrel proof"]
 
 [boards]
-# NOTE: StockShipped (warehouse->board shipment report) was RETIRED by NC ABC in 2026;
-# watch_boards is legacy/unused, kept only for if the state ever restores that feed.
-watch_boards = ["Wake", "Durham", "Mecklenburg", "Orange", "Chapel Hill"]
 # ABC/GO per-store inventory: board subdomains of abcgo.app to poll (public, no login).
 # Empty by default — the only live ABC/GO board, New Hanover ("nh" / Wilmington),
 # is ~2.5h from Hillsborough, out of practical driving range, so it's back-burnered

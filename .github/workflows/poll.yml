@@ -49,9 +49,13 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: poll
-  cancel-in-progress: false
+# Deliberately NOT a workflow-level group. The poll job commits the DB and must
+# be serialised; the deploy job just waits on GitHub Pages and can take ten
+# minutes to do it. Sharing one group meant a slow Pages deploy held the lock,
+# the next scheduled poll queued behind it, and the one after that evicted the
+# queued run — Actions keeps only one pending run per group. Two polls were
+# cancelled outright that way on 2026-08-06. Separate groups let a stuck deploy
+# be slow without costing a poll.
 
 env:
   DISPATCH: ${{ github.event_name == 'workflow_dispatch' && inputs.loops || '' }}
@@ -59,8 +63,17 @@ env:
 jobs:
   poll:
     runs-on: ubuntu-latest
+    concurrency:
+      group: poll-db          # serialises the DB commit; two polls must not race
+      cancel-in-progress: false
     outputs:
-      publish: ${{ steps.which.outputs.publish }}
+      # Whether an artifact actually landed — not merely whether we meant to
+      # publish, and not merely whether the render worked. `deploy` has nothing
+      # to do without one, and `deploy-pages` reports its absence as an opaque
+      # failure two jobs from the cause. Keyed on the UPLOAD, because rendering
+      # successfully and then failing to upload is a real path: artifact upload
+      # is a network operation of its own.
+      deployable: ${{ steps.upload.outcome == 'success' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -121,7 +134,6 @@ jobs:
         run: |
           python -m ncbourbon poll-boards
           python -m ncbourbon poll-wake
-          python -m ncbourbon poll-shipments   # liveness ping only (StockShipped retired)
 
       - name: Daily catalog, report, prune
         if: steps.which.outputs.daily == 'true'
@@ -139,6 +151,7 @@ jobs:
       # collected — including the health row recording the failure. SQLite
       # commits per loop, so what lands is consistent, just partial.
       - name: Commit DB state
+        id: commit
         if: always()
         run: |
           git config user.name "ncbourbon-bot"
@@ -147,12 +160,34 @@ jobs:
           git diff --cached --quiet || git commit -m "db: poll $(date -u +%FT%TZ)"
           git push
 
+      # Not the default success() gate, for the same reason "Commit DB state"
+      # above runs on always(): a loop failing does not make the rest of the run
+      # worthless. Every poll failure so far has been a read timeout on
+      # abc2.nc.gov that recovered on the next tick, and under success() one of
+      # those took the *page* down for the cycle too — the site kept serving an
+      # eight-hour-old copy because a sixty-second hiccup had skipped the render.
+      # A partial read is honest here: `render-site` stamps generated_at and the
+      # per-source freshness chips come from health.last_ok, so a stocks failure
+      # shows as a red `stocks` chip rather than as a silently frozen page.
+      #
+      # A failed COMMIT is the different case, and it does block. The page is a
+      # view of the DB, and an unpushed DB is one the next run will never see:
+      # it checks out the older file and re-derives from there, so a page built
+      # on the discarded state would show history that then rolls back. Publish
+      # only what is durable. The two conditions are not the same thing wearing
+      # different hats — one is incomplete data, honestly labelled; the other is
+      # data the system is about to forget.
       - name: Render site
-        if: steps.which.outputs.publish == 'true'
+        id: render
+        if: ${{ !cancelled() && steps.commit.outcome == 'success' && steps.which.outputs.publish == 'true' }}
         run: python -m ncbourbon render-site --out site
 
+      # Gated on the render, not on `publish`. Uploading unconditionally would
+      # hand `deploy` a missing artifact and turn a clear "render-site failed"
+      # into an opaque one two jobs later.
       - uses: actions/upload-pages-artifact@v3
-        if: steps.which.outputs.publish == 'true'
+        id: upload
+        if: ${{ !cancelled() && steps.render.outcome == 'success' }}
         with:
           path: site
 
@@ -161,8 +196,14 @@ jobs:
   # hand; there is no API-free way to do it from here.
   deploy:
     needs: poll
-    if: needs.poll.outputs.publish == 'true'
+    # `!cancelled()` rather than success(): see "Render site". The artifact is
+    # uploaded whenever the render worked, so requiring the whole poll job to be
+    # green would throw away a perfectly good page over one timed-out source.
+    if: ${{ !cancelled() && needs.poll.outputs.deployable == 'true' }}
     runs-on: ubuntu-latest
+    concurrency:
+      group: pages            # Pages deploys one at a time; keep them off poll-db
+      cancel-in-progress: false
     permissions:
       pages: write
       id-token: write

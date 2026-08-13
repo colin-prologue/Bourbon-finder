@@ -27,7 +27,6 @@ Events:
   stock_new       — watched item appears with stock > 0 (was absent or 0)
   stock_drawdown  — watched item's Total Available fell by >= drawdown_alert_fraction
   catalog_new     — brand-new NC Code in Special Items / price list / new items
-  shipment        — bottles of a watched code shipped to a watched board
   board_restock   — watched code went 0 -> >0 at one or more stores of a board
   wake_restock    — same, for the legacy standalone Wake path
 """
@@ -220,29 +219,6 @@ def apply_catalog_items(
             )
     for source in complete:
         mark_seeded(conn, f"catalog:{source}")
-    conn.commit()
-    return events
-
-
-def apply_shipments(conn: sqlite3.Connection, rows, watch_codes: set[str], watch_boards: list[str]) -> list[Event]:
-    events: list[Event] = []
-    ts = now_iso()
-    for r in rows:
-        conn.execute(
-            "INSERT OR IGNORE INTO shipments (board, nc_code, product, bottles, observed_at) VALUES (?,?,?,?,?)",
-            (r.board, r.nc_code, r.product, r.bottles, ts),
-        )
-        board_watched = not watch_boards or any(b.lower() in r.board.lower() for b in watch_boards)
-        if r.nc_code in watch_codes and board_watched and r.bottles > 0:
-            events.append(
-                Event(
-                    "shipment",
-                    f"{r.nc_code}:{r.board}",
-                    f"[NC] Shipped to {r.board}: {r.product}",
-                    f"{r.bottles} bottles of {r.product} ({r.nc_code}) shipped to {r.board}.\n"
-                    "Pre-shelf signal — expect availability there shortly.",
-                )
-            )
     conn.commit()
     return events
 

@@ -1,7 +1,6 @@
 """Command-line entry points.
 
   python -m ncbourbon poll-stocks     # every 15 min  (state warehouse differ)
-  python -m ncbourbon poll-shipments  # DEPRECATED liveness ping (StockShipped retired)
   python -m ncbourbon poll-boards     # a few times/day (ABC/GO per-store board inventory)
   python -m ncbourbon poll-catalog    # daily (Special Items, new items, xlsx)
   python -m ncbourbon poll-wake       # 2-4x/day (Wake ABC store inventory)
@@ -18,7 +17,6 @@ import hashlib
 import logging
 import re
 
-from . import alerts as alerts_mod
 from .alerts import alert, send_digest
 from .config import load_config
 from .db import connect, now_iso, record_coverage, record_health
@@ -27,7 +25,6 @@ from .diff import (
     alertable_codes,
     apply_board_snapshot,
     apply_catalog_items,
-    apply_shipments,
     apply_stock_snapshot,
     apply_wake_snapshot,
     watch_codes,
@@ -36,7 +33,7 @@ from .http import make_session
 from .report import build_report, render_text
 from .site import render_site
 from .sources import catalog as catalog_mod
-from .sources import abcgo, durham, greensboro, stock_shipped, stocks, wake
+from .sources import abcgo, durham, greensboro, stocks, wake
 
 log = logging.getLogger("ncbourbon")
 
@@ -78,26 +75,18 @@ def cmd_poll_stocks(conn, cfg, session):
     log.info("stocks: %d rows (report %s), %d events", len(rows), report_date, len(events))
 
 
-def cmd_poll_shipments(conn, cfg, session):
-    """DEPRECATED liveness check. StockShipped (the warehouse->board shipment
-    report) was RETIRED by NC ABC — confirmed 2026-07-22: the route returns the
-    app's "no longer available" page and is gone from the site nav. The board
-    leg now lives in `poll-boards` (ABC/GO per-store inventory). We keep a cheap
-    ping here only so we learn if the state ever restores the shipment feed."""
-    try:
-        form = stock_shipped.discover_form(session, timeout=cfg.request_timeout)
-    except Exception as exc:  # noqa: BLE001
-        _health(conn, cfg, "stock_shipped", False, str(exc))
-        return
-    if form is None:
-        _health(conn, cfg, "stock_shipped", False,
-                "retired: endpoint serves 'no longer available' (board leg = poll-boards)")
-        log.info("poll-shipments: StockShipped still retired; use poll-boards for the board leg")
-        return
-    # If we ever get here, the state brought the feed back — worth a heads-up.
-    _health(conn, cfg, "stock_shipped", True)
-    log.warning("StockShipped appears RESTORED (%d boards) — shipment parsing could be re-enabled",
-                len(form.board_options))
+# StockShipped — the statewide warehouse->board shipment feed, and the only
+# thing that ever predicted which county a bottle would route to — was retired
+# by NC ABC (confirmed 2026-07-22: the route serves the app's "no longer
+# available" page and is gone from the site nav). `poll-shipments` survived as
+# a liveness ping for a while, and the whole leg behind it — apply_shipments,
+# the `shipments` table, `[boards] watch_boards` — survived with it.
+#
+# All of it is gone now. The ping cost a request on every board poll and pinned
+# a health row at 57 consecutive failures forever, which is a permanently lit
+# warning light for a working system: exactly the thing that teaches you to
+# stop reading the health table. The parser is in git history if the state ever
+# restores the feed, and a quarterly manual check is the honest way to notice.
 
 
 def _watchlist_terms(conn, watch) -> list[str]:
@@ -464,7 +453,7 @@ def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     p = argparse.ArgumentParser(prog="ncbourbon")
     p.add_argument("command", choices=[
-        "poll-stocks", "poll-shipments", "poll-boards", "poll-catalog", "poll-wake", "digest", "status",
+        "poll-stocks", "poll-boards", "poll-catalog", "poll-wake", "digest", "status",
         "backfill", "history", "prune", "report", "render-site",
     ])
     p.add_argument("arg", nargs="?", default=None, help="NC code (for history)")
@@ -482,7 +471,6 @@ def main(argv=None):
     session = make_session(cfg.user_agent)
     {
         "poll-stocks": lambda: cmd_poll_stocks(conn, cfg, session),
-        "poll-shipments": lambda: cmd_poll_shipments(conn, cfg, session),
         "poll-boards": lambda: cmd_poll_boards(conn, cfg, session),
         "poll-catalog": lambda: cmd_poll_catalog(conn, cfg, session),
         "poll-wake": lambda: cmd_poll_wake(conn, cfg, session),
