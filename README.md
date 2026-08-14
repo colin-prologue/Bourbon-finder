@@ -18,7 +18,7 @@ stages:
 
 | Loop | Source | Cadence | What it catches |
 |---|---|---|---|
-| `poll-stocks` | Warehouse Stock Report (`abc2.nc.gov/StoresBoards/Stocks`) | every 15–20 min | **Stage A (radar):** Allocation/Limited items appearing in state stock; drawdowns as boards order |
+| `poll-stocks` | Warehouse Stock Report (`abc2.nc.gov/StoresBoards/Stocks`) | every 2h | **Stage A (radar):** Allocation/Limited items appearing in state stock; drawdowns as boards order |
 | `poll-boards` | Per-store board sites: Durham + Greensboro (in range of Hillsborough) | 2–4×/day | **Stage B (confirmation):** which shelf a rare bottle is on right now — emits `board_restock` |
 | `poll-wake` | Wake ABC store search (`wakeabc.com`) | 2–4×/day | store-level Wake restocks with addresses and quantities (separate legacy Wake path) |
 | `poll-catalog` | Special Items, New Items, allocated-list xlsx | daily | new NC Codes entering the system (~1 month early) |
@@ -165,10 +165,21 @@ second poll of each source.
 ### Scheduling on your own box (recommended)
 
 ```cron
-*/20 * * * *  cd /path/to/nc-bourbon-finder && .venv/bin/python -m ncbourbon poll-stocks
+17 */2 * * *  cd /path/to/nc-bourbon-finder && .venv/bin/python -m ncbourbon poll-stocks
 15 8,12,17 * * *  cd /path/to/nc-bourbon-finder && { rc=0; .venv/bin/python -m ncbourbon poll-boards || rc=1; .venv/bin/python -m ncbourbon poll-wake || rc=1; exit $rc; }
 5 6 * * *  cd /path/to/nc-bourbon-finder && { rc=0; .venv/bin/python -m ncbourbon poll-catalog || rc=1; .venv/bin/python -m ncbourbon digest || rc=1; .venv/bin/python -m ncbourbon prune || rc=1; exit $rc; }
 ```
+
+**Two-hourly stocks, not every 20 minutes.** The state publishes the warehouse
+report as a *daily* artifact, so `warehouse_snapshot` keeps one row per code per
+report day — polling it 72×/day re-reads the same figure and stores it once.
+What a faster poll actually buys is a fresher `Total Available` for the drawdown
+signal, and drawdown is a trend over days, not minutes. The Actions workflow has
+a second reason (Actions throttles frequent schedules on public repos, and each
+poll commits the DB, which is the repo's size), but the politeness argument
+stands on its own and applies to a local install too. The source refreshes about
+every 15 minutes, so if you genuinely want a faster local cadence you have room
+— just don't take it by default.
 
 **Run each command, then report the worst — do not chain them with `&&`.** A
 poll command exits non-zero once a source has failed `HEALTH_ALERT_THRESHOLD`

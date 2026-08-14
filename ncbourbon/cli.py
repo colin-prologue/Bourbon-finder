@@ -1,6 +1,6 @@
 """Command-line entry points.
 
-  python -m ncbourbon poll-stocks     # every 15 min  (state warehouse differ)
+  python -m ncbourbon poll-stocks     # every 2h (state warehouse differ)
   python -m ncbourbon poll-boards     # a few times/day (ABC/GO per-store board inventory)
   python -m ncbourbon poll-catalog    # daily (Special Items, new items, xlsx)
   python -m ncbourbon poll-wake       # 2-4x/day (Wake ABC store inventory)
