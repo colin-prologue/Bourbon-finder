@@ -767,6 +767,88 @@ def test_a_board_restock_sends_no_mail(monkeypatch):
     for _ in range(cli.HEALTH_ALERT_THRESHOLD):
         cli._health(conn, cfg, "nh", False, "boom")
     assert len(sent) == 1 and "source failing" in sent[0]
+
+
+def test_a_blip_is_green_and_a_dead_source_is_red():
+    """Red must mean "a source is broken", not "a server was slow once".
+
+    The two had it backwards: `poll-stocks` exited 1 on a single read timeout
+    that recovered on the next tick, while a board dark for three weeks reported
+    success every run because its failure only reached the health table. So the
+    run's colour told you about the least consequential failure in the system
+    and stayed silent about the most.
+
+    `_health` now returns the verdict `main` exits on, and it is the SAME
+    threshold that sends the email — one meaning for red on every surface.
+    """
+    from ncbourbon import cli
+    from ncbourbon.config import Config
+    from ncbourbon.db import connect
+
+    conn = connect(":memory:")
+    cfg = Config()          # alerts disabled: no smtp_host, so nothing is sent
+
+    # A blip, and even a few of them, is not a call to action.
+    for i in range(cli.HEALTH_ALERT_THRESHOLD - 1):
+        assert cli._health(conn, cfg, "durham", False, "read timeout") is True, (
+            f"failure {i + 1} of {cli.HEALTH_ALERT_THRESHOLD} should not fail the run"
+        )
+    # Crossing the threshold does turn it red, and it stays red while broken.
+    assert cli._health(conn, cfg, "durham", False, "read timeout") is False
+    assert cli._health(conn, cfg, "durham", False, "read timeout") is False
+    # Recovery clears it immediately — the counter resets, so the next run is
+    # green without anyone having to acknowledge anything.
+    assert cli._health(conn, cfg, "durham", True) is True
+
+
+def test_one_broken_board_does_not_hide_the_others_verdict():
+    """poll-boards polls every board before reporting, and reports the worst.
+
+    Returning early on the first failure would both skip healthy boards and let
+    a later breakage go unreported for as long as an earlier one persisted.
+    """
+    from ncbourbon import cli
+    from ncbourbon.config import Config
+    from ncbourbon.db import connect
+    from ncbourbon.sources import durham as durham_mod
+    from ncbourbon.sources import greensboro as greensboro_mod
+
+    conn = connect(":memory:")
+    cfg = Config()
+    cfg.boards.abcgo_boards = []
+    cfg.boards.durham = True
+    cfg.boards.greensboro = True
+    cfg.boards.search_terms = ["blanton"]
+
+    seen: list[str] = []
+
+    def dead_durham(*a, **k):
+        seen.append("durham")
+        raise RuntimeError("durham search: HTTP 403")
+
+    def live_greensboro(*a, **k):
+        seen.append("greensboro")
+        return []
+
+    import pytest as _pytest
+    monkey = _pytest.MonkeyPatch()
+    monkey.setattr(durham_mod, "fetch_durham_stock", dead_durham)
+    monkey.setattr(greensboro_mod, "fetch_greensboro_stock", live_greensboro)
+    try:
+        # Below the threshold: Durham is failing but not yet broken, so the run
+        # is still green — and Greensboro was polled either way.
+        for _ in range(cli.HEALTH_ALERT_THRESHOLD - 1):
+            assert cli.cmd_poll_boards(conn, cfg, object()) is True
+        assert cli.cmd_poll_boards(conn, cfg, object()) is False
+        assert seen.count("greensboro") == cli.HEALTH_ALERT_THRESHOLD, (
+            "a dead Durham must never stop Greensboro being polled"
+        )
+    finally:
+        monkey.undo()
+
+    # Greensboro stayed healthy throughout and says so.
+    row = conn.execute("SELECT consecutive_failures FROM health WHERE source='greensboro'").fetchone()
+    assert row["consecutive_failures"] == 0
 def _report_fixture_db():
     """A DB with one watched product on two shelves, one unwatched product,
     and one product on an out-of-range board."""
@@ -1420,7 +1502,9 @@ def test_abcgo_search_ok_details_403_does_not_zero(monkeypatch):
     cfg = Config()
     cfg.boards.abcgo_boards = ["nh"]; cfg.boards.durham = False; cfg.boards.greensboro = False
     cfg.boards.search_terms = ["buffalo"]
-    monkeypatch.setattr(cli, "_health", lambda *a, **k: None)
+    # Stubbed out because this test is about the differ, not health bookkeeping.
+    # It must still return the healthy verdict `cmd_poll_boards` accumulates.
+    monkeypatch.setattr(cli, "_health", lambda *a, **k: True)
     # Previously in stock.
     apply_board_snapshot(conn, [BoardStoreStock("nh", "20624", "Buffalo Trace", "22.95", "6 Market St", 5)],
                          observed={("nh", "20624")})

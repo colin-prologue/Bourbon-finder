@@ -51,7 +51,24 @@ HEALTH_ALERT_THRESHOLD = 4  # consecutive failures before we email about a broke
 # now has exactly one caller: `_health`, below. Everything else is pull.
 
 
-def _health(conn, cfg, source: str, ok: bool, error: str = ""):
+def _health(conn, cfg, source: str, ok: bool, error: str = "") -> bool:
+    """Record this source's outcome; return False once it is PERSISTENTLY broken.
+
+    The return value is what decides the process exit code, and it is
+    deliberately the same threshold that sends the email rather than "did
+    anything go wrong just now". A run's red/green had the meaning exactly
+    inverted before: `poll-stocks` exited 1 on a single read timeout that
+    recovered on the next tick, while a board going dark for three weeks kept
+    reporting success because its failure only ever reached the health table.
+    So red meant "the state server was slow once" and green meant nothing at
+    all.
+
+    Tying it to HEALTH_ALERT_THRESHOLD gives red one meaning on every surface: a
+    source that has failed four times running is broken, is emailed about, shows
+    a stale chip on the page, and fails the run. One blip is none of those
+    things — which is the honest reading, because one blip genuinely does not
+    need a human.
+    """
     fails = record_health(conn, source, ok, error)
     if not ok and fails == HEALTH_ALERT_THRESHOLD:
         alert(
@@ -61,18 +78,21 @@ def _health(conn, cfg, source: str, ok: bool, error: str = ""):
             "The site may have changed its markup or URL (NC ABC migrated hosts "
             "before). Check the parsers.",
         )
+    return fails < HEALTH_ALERT_THRESHOLD
 
 
-def cmd_poll_stocks(conn, cfg, session):
+def cmd_poll_stocks(conn, cfg, session) -> bool:
     try:
         report_date, rows = stocks.fetch_and_parse(session, timeout=cfg.request_timeout)
     except Exception as exc:  # noqa: BLE001 — record and alert on repeated failure
         log.error("poll-stocks failed: %s", exc, exc_info=True)
-        _health(conn, cfg, "stocks", False, str(exc))
-        raise SystemExit(1)
-    _health(conn, cfg, "stocks", True)
+        # Returning rather than raising: the exit code is decided in `main` from
+        # the health threshold, so a lone timeout no longer paints the run red.
+        return _health(conn, cfg, "stocks", False, str(exc))
+    healthy = _health(conn, cfg, "stocks", True)
     events = apply_stock_snapshot(conn, rows, cfg.watch, report_date.isoformat())
     log.info("stocks: %d rows (report %s), %d events", len(rows), report_date, len(events))
+    return healthy
 
 
 # StockShipped — the statewide warehouse->board shipment feed, and the only
@@ -156,14 +176,21 @@ def _watchlist_terms(conn, watch) -> list[str]:
     return sorted(terms)
 
 
-def cmd_poll_boards(conn, cfg, session):
-    """Board leg: poll each ABC/GO board's public per-store inventory API for the
-    hot watchlist, emitting board_restock (on-shelf) alerts. Stage B of the
-    two-stage model — stage A is poll-stocks (warehouse arrival)."""
+def cmd_poll_boards(conn, cfg, session) -> bool:
+    """Board leg: poll each board's public per-store inventory for the hot
+    watchlist. Stage B of the two-stage model — stage A is poll-stocks
+    (warehouse arrival).
+
+    Returns False if any board is persistently broken (see `_health`). Boards
+    are polled independently and a failure in one must not skip the others: a
+    Durham outage is not a reason to stop looking at Greensboro, and the run
+    reports the verdict once at the end.
+    """
     terms = list(cfg.boards.search_terms) or _watchlist_terms(conn, cfg.watch)
     if not terms:
         log.info("poll-boards: empty watchlist and no configured search_terms; run poll-stocks first")
-        return
+        return True
+    healthy = True
     all_rows = []
     observed: set[tuple[str, str]] = set()   # (board, code) whose per-store state we know this run
     complete: set[str] = set()               # boards that fetched cleanly -> may establish a baseline
@@ -202,7 +229,7 @@ def cmd_poll_boards(conn, cfg, session):
         except Exception as exc:  # noqa: BLE001
             ok, err = False, f"{board}: {exc}"
             log.warning("abcgo board %s failed: %s", board, exc, exc_info=True)
-        _health(conn, cfg, f"abcgo:{board}", ok, err)
+        healthy &= _health(conn, cfg, f"abcgo:{board}", ok, err)
     if cfg.boards.durham:
         ok, err = True, ""
         try:
@@ -230,7 +257,7 @@ def cmd_poll_boards(conn, cfg, session):
             log.warning("durham board failed: %s", exc, exc_info=True)
         if ok:
             complete.add("durham")
-        _health(conn, cfg, "durham", ok, err)
+        healthy &= _health(conn, cfg, "durham", ok, err)
     if cfg.boards.greensboro:
         ok, err = True, ""
         try:
@@ -240,7 +267,7 @@ def cmd_poll_boards(conn, cfg, session):
             log.warning("greensboro board failed: %s", exc, exc_info=True)
         if ok:
             complete.add("greensboro")
-        _health(conn, cfg, "greensboro", ok, err)
+        healthy &= _health(conn, cfg, "greensboro", ok, err)
     # Fingerprint of what we searched, so the differ can tell "this bottle just
     # arrived" from "we just started looking for it" — see apply_board_snapshot.
     coverage = hashlib.sha256("\n".join(sorted(terms)).encode()).hexdigest()[:16]
@@ -251,9 +278,10 @@ def cmd_poll_boards(conn, cfg, session):
     )
     log.info("boards: %d store-rows across %d board(s), %d events",
              len(all_rows), len(cfg.boards.abcgo_boards), len(events))
+    return healthy
 
 
-def cmd_poll_catalog(conn, cfg, session):
+def cmd_poll_catalog(conn, cfg, session) -> bool:
     ok = True
     err = ""
     items = []
@@ -317,13 +345,14 @@ def cmd_poll_catalog(conn, cfg, session):
         ok = False
         err = f"allocated_xlsx: {exc}"
         log.warning(err)
-    _health(conn, cfg, "catalog", ok, err)
+    healthy = _health(conn, cfg, "catalog", ok, err)
     log.info("catalog: %d items ingested, %d events", len(items), len(events))
+    return healthy
 
 
-def cmd_poll_wake(conn, cfg, session):
+def cmd_poll_wake(conn, cfg, session) -> bool:
     if not cfg.wake.enabled:
-        return
+        return True
     all_rows = []
     ok, err = True, ""
     for term in cfg.wake.search_terms:
@@ -333,7 +362,7 @@ def cmd_poll_wake(conn, cfg, session):
         except Exception as exc:  # noqa: BLE001
             ok, err = False, f"{term}: {exc}"
             log.warning("wake search %r failed: %s", term, exc)
-    _health(conn, cfg, "wake", ok, err)
+    healthy = _health(conn, cfg, "wake", ok, err)
     # de-dup across overlapping search terms
     seen = {}
     for r in all_rows:
@@ -349,6 +378,7 @@ def cmd_poll_wake(conn, cfg, session):
         ).hexdigest()[:16],
     )
     log.info("wake: %d store-rows, %d events", len(seen), len(events))
+    return healthy
 
 
 def cmd_backfill(conn, cfg, session, days: int, delay: float):
@@ -469,7 +499,7 @@ def main(argv=None):
     cfg = load_config(args.config)
     conn = connect(cfg.db_path)
     session = make_session(cfg.user_agent)
-    {
+    outcome = {
         "poll-stocks": lambda: cmd_poll_stocks(conn, cfg, session),
         "poll-boards": lambda: cmd_poll_boards(conn, cfg, session),
         "poll-catalog": lambda: cmd_poll_catalog(conn, cfg, session),
@@ -482,6 +512,20 @@ def main(argv=None):
         "history": lambda: cmd_history(conn, args.arg or ""),
         "prune": lambda: cmd_prune(conn, args.snapshot_days, args.board_days),
     }[args.command]()
+    # Only the poll commands return a verdict; everything else returns None and
+    # is judged solely on not having raised. `is False` rather than falsiness,
+    # so a command that legitimately returns nothing never fails the run.
+    #
+    # This runs AFTER the command, which matters: every applier commits as it
+    # goes, so a broken source colours the exit code without costing the run the
+    # work it did manage. The scheduled workflow relies on that — it still
+    # commits the DB and republishes the page on a red run.
+    if outcome is False:
+        log.error(
+            "a source has now failed %d or more consecutive polls — see "
+            "`python -m ncbourbon status`", HEALTH_ALERT_THRESHOLD,
+        )
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
