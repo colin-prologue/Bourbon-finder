@@ -72,6 +72,11 @@ def watch_codes(conn: sqlite3.Connection, watch: WatchConfig) -> set[str]:
     Name-pattern matches are not resolvable to codes here — patterns match a
     product name, and a code's name is only known per row — so callers pass
     rows through `name_watched` as well. See `alertable_codes`.
+
+    `exclude_codes` is subtracted LAST, so it beats every widening rule above
+    it. That ordering is the point: the universe is derived from what the state
+    publishes, and the only way to say "not this one" is to have the manual
+    answer win over the automatic ones.
     """
     codes: set[str] = set()
     if watch.listing_types:
@@ -84,15 +89,21 @@ def watch_codes(conn: sqlite3.Connection, watch: WatchConfig) -> set[str]:
             )
         }
     codes |= {r["nc_code"] for r in conn.execute("SELECT nc_code FROM allocated_list")}
-    return codes
+    return codes - watch.exclude_codes
 
 
 def alertable_codes(conn: sqlite3.Connection, watch: WatchConfig, rows) -> set[str]:
     """`watch_codes` plus any code among `rows` whose product name matches a
-    configured pattern. Computed once per poll and handed to the appliers."""
+    configured pattern. Computed once per poll and handed to the appliers.
+
+    The pattern union has to be excluded again after the fact: `watch_codes`
+    already subtracted, but a name-pattern match adds codes back in from this
+    poll's rows, and an excluded bottle whose name happens to match a pattern
+    would otherwise walk straight back into the universe through that door.
+    """
     codes = watch_codes(conn, watch)
     codes |= {r.plu for r in rows if name_watched(getattr(r, "name", ""), watch)}
-    return codes
+    return codes - watch.exclude_codes
 
 
 def pattern_matched_codes(conn: sqlite3.Connection, watch: WatchConfig) -> set[str]:
@@ -116,7 +127,10 @@ def pattern_matched_codes(conn: sqlite3.Connection, watch: WatchConfig) -> set[s
         for r in conn.execute(f"SELECT DISTINCT {code_col} AS c, {name_col} AS n FROM {table}"):
             if name_watched(r["n"], watch):
                 codes.add(r["c"])
-    return codes
+    # Same reason as `alertable_codes`: this is a widening rule, so exclusion
+    # has to be applied after it or the page and the report would keep showing
+    # a bottle that every other surface has dropped.
+    return codes - watch.exclude_codes
 
 
 def apply_stock_snapshot(

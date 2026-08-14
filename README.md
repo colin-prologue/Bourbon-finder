@@ -50,7 +50,10 @@ for the page:
 - **Store everything, surface little.** Every row a source returns is
   persisted — the report wants the whole inventory picture. Only codes in the
   watch universe (Allocation/Limited in the warehouse, plus the state's
-  official allocated list, plus `name_patterns` matches) count as events.
+  official allocated list, plus `name_patterns` matches, **minus
+  `[watch] exclude_codes`**) count as events. That universe is derived from
+  what the state publishes, so `exclude_codes` is the only place a human gets
+  to say "not this one" — and it is subtracted last, after every widening rule.
   Board search APIs match loosely: a bourbon watchlist pulled back 285
   Greensboro codes, 28 of which were actually allocated.
 - **One event per product, not per store.** A county delivery puts a bottle on
@@ -208,11 +211,35 @@ These are public government pages presenting public records, and at least
 two third-party trackers poll them openly at the same cadence. Still, be a
 good citizen — the defaults already are:
 
-- Poll no faster than sources refresh (15 min stocks; ~2×/day Wake).
-- One bulk request per cycle (empty search returns the whole report).
+- Poll no faster than sources refresh (2-hourly stocks; ~2–4×/day boards).
 - Identifying User-Agent with contact email (set yours in config.toml).
-- Exponential backoff; after 4 consecutive failures the tool emails you and
-  the health record shows it — it never hammers a struggling server.
+- Exponential backoff; after 4 consecutive failures the tool emails you, fails
+  the run, and the health record shows it — it never hammers a struggling server.
+
+**What each loop actually costs**, because "be polite" is worth stating in
+requests rather than in adjectives:
+
+| Loop | Requests per run |
+|---|---|
+| `poll-stocks` | **1.** An empty search returns the whole warehouse report |
+| `poll-catalog` | **3.** Two price tables and the allocated xlsx |
+| `poll-boards` | **one search per watch term, per board**, plus one detail page per relevant code on Durham |
+| `poll-wake` | one search per `[wake] search_terms` entry (10 by default) |
+
+Only the first two are the "one bulk request" shape. The board leg is not, and
+saying otherwise would be flattering rather than accurate: search terms are
+derived from the live watchlist, so the count moves on its own. As of
+2026-08-14 that is **139 terms**, and Durham's last run fetched **211** detail
+pages — so a board poll is several hundred requests spread over a few minutes,
+four times a day, against two county servers.
+
+Two things hold that number down, and both are worth keeping:
+`[watch] exclude_codes` removes a bottle's term from every board (the 17 codes
+excluded on 2026-08-14 took 150 terms down to 139), and Durham's
+`MAX_DETAIL_FETCHES` is a runaway guard for the case where the derived list
+grows without anyone noticing. If this ever needs to come down further, the
+lever is fewer watched bottles, not a lower ceiling — a ceiling that binds is
+silent coverage loss, which is how Durham spent three weeks skipping 61 codes.
 
 ## Known quirks (from live testing)
 
