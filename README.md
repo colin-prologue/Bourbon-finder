@@ -163,9 +163,21 @@ second poll of each source.
 
 ```cron
 */20 * * * *  cd /path/to/nc-bourbon-finder && .venv/bin/python -m ncbourbon poll-stocks
-15 8,12,17 * * *  cd /path/to/nc-bourbon-finder && .venv/bin/python -m ncbourbon poll-boards && .venv/bin/python -m ncbourbon poll-wake
-5 6 * * *  cd /path/to/nc-bourbon-finder && .venv/bin/python -m ncbourbon poll-catalog && .venv/bin/python -m ncbourbon digest && .venv/bin/python -m ncbourbon prune
+15 8,12,17 * * *  cd /path/to/nc-bourbon-finder && { rc=0; .venv/bin/python -m ncbourbon poll-boards || rc=1; .venv/bin/python -m ncbourbon poll-wake || rc=1; exit $rc; }
+5 6 * * *  cd /path/to/nc-bourbon-finder && { rc=0; .venv/bin/python -m ncbourbon poll-catalog || rc=1; .venv/bin/python -m ncbourbon digest || rc=1; .venv/bin/python -m ncbourbon prune || rc=1; exit $rc; }
 ```
+
+**Run each command, then report the worst — do not chain them with `&&`.** A
+poll command exits non-zero once a source has failed `HEALTH_ALERT_THRESHOLD`
+(4) polls in a row, so `&&` would let one broken source stop everything after
+it: a dead Durham would silently stop Wake being polled at all, and a catalog
+feed the state broke would stop `prune`, which is the only thing bounding the
+database's growth. A bare `;` is not enough either — the chain would then exit
+with the *last* command's status and an early failure would read as success.
+`.github/workflows/poll.yml` uses the same `rc` shape for the same reason.
+
+The `cd` keeps its `&&` on purpose: running from the wrong directory would
+quietly create a second database.
 
 `prune` trims history to the retention horizon (`--snapshot-days`, default 365;
 `--board-days`, default 90) and VACUUMs. Run it daily, never per poll — it

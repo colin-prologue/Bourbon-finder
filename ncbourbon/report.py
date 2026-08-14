@@ -391,7 +391,20 @@ def _coverage_note(row) -> str:
     return "; ".join(parts)
 
 
-def build_report(conn: sqlite3.Connection, cfg: Config, window_hours: int = 24) -> Report:
+# How far back "changed recently" looks. Three days, not one: watched products
+# cross the zero line on a reachable shelf about three times a day, so a 24h
+# window was routinely empty — and an empty section on the page reads as "this
+# thing is broken", not as "nothing happened". The page is now the entire
+# product (there is no product email), so a section that is blank half the time
+# is a real cost rather than a cosmetic one. Boards only refresh their own
+# numbers a couple of times a day, which makes a one-day window narrower than
+# the data's own resolution anyway.
+CHANGE_WINDOW_HOURS = 72
+
+
+def build_report(
+    conn: sqlite3.Connection, cfg: Config, window_hours: int = CHANGE_WINDOW_HOURS
+) -> Report:
     # Patterns resolve against stored product names, not against a poll's rows —
     # otherwise a product watched only by name_patterns is alertable but absent
     # from every surface that reads the database.

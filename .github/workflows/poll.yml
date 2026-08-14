@@ -131,19 +131,33 @@ jobs:
         if: steps.which.outputs.boards == 'true'
         env:
           NCBOURBON_SMTP_PASSWORD: ${{ secrets.NCBOURBON_SMTP_PASSWORD }}
+        # Each loop runs regardless of the others, then the step reports the
+        # worst outcome. A poll command now exits non-zero once a source has
+        # failed HEALTH_ALERT_THRESHOLD times running, and under the default
+        # `bash -e` that would abort the step — so a persistently broken Durham
+        # would silently stop Wake from being polled at all. A board being down
+        # is not a reason to stop looking at the others.
         run: |
-          python -m ncbourbon poll-boards
-          python -m ncbourbon poll-wake
+          rc=0
+          python -m ncbourbon poll-boards || rc=1
+          python -m ncbourbon poll-wake   || rc=1
+          exit $rc
 
       - name: Daily catalog, report, prune
         if: steps.which.outputs.daily == 'true'
         env:
           NCBOURBON_SMTP_PASSWORD: ${{ secrets.NCBOURBON_SMTP_PASSWORD }}
           NCBOURBON_SUBSCRIBERS: ${{ secrets.NCBOURBON_SUBSCRIBERS }}
+        # Same shape as the board step, and `prune` is the reason it matters:
+        # it is the only thing bounding the DB's growth, and the DB's size is
+        # the repo's size. Chaining it behind a catalog feed that the state
+        # broke would stop the trimming for as long as the outage lasted.
         run: |
-          python -m ncbourbon poll-catalog
-          python -m ncbourbon digest
-          python -m ncbourbon prune
+          rc=0
+          python -m ncbourbon poll-catalog || rc=1
+          python -m ncbourbon digest       || rc=1
+          python -m ncbourbon prune        || rc=1
+          exit $rc
 
       # Runs even when a loop above failed. Every failure so far has been an
       # upstream read timeout on abc2.nc.gov, and the default success() gate
