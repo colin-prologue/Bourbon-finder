@@ -234,15 +234,23 @@ requests rather than in adjectives:
 |---|---|
 | `poll-stocks` | **1.** An empty search returns the whole warehouse report |
 | `poll-catalog` | **3.** Two price tables and the allocated xlsx |
-| `poll-boards` | **one search per watch term, per board**, plus one detail page per relevant code on Durham |
 | `poll-wake` | one search per `[wake] search_terms` entry (10 by default) |
+| `poll-boards` → Durham | one search per term, **plus** one detail page per relevant code (ceiling `MAX_DETAIL_FETCHES`, 400) |
+| `poll-boards` → Greensboro | one search per term, **paginated** — 50 items per request, so a term matching more than 50 costs one request per extra page (guard `MAX_ITEMS`, 1000, i.e. up to 20) |
+| `poll-boards` → ABC/GO *(off by default)* | one search per term, **plus** one detail page per code found in stock, **plus** up to `MAX_RECHECK` (40) sellout re-checks |
 
 Only the first two are the "one bulk request" shape. The board leg is not, and
-saying otherwise would be flattering rather than accurate: search terms are
-derived from the live watchlist, so the count moves on its own. As of
-2026-08-14 that is **139 terms**, and Durham's last run fetched **211** detail
-pages — so a board poll is several hundred requests spread over a few minutes,
-four times a day, against two county servers.
+saying otherwise would be flattering rather than accurate. Every board multiplies
+by the term count, which is derived from the live watchlist and moves on its own:
+as of 2026-08-14 it is **139 terms**, and Durham's last run fetched **211**
+detail pages. So a board poll is several hundred requests spread over a few
+minutes, four times a day.
+
+Note this is per *board*, not per run — the row costs stack, and two of the three
+have a second multiplier on top of the term count. ABC/GO contributes nothing
+today (`abcgo_boards = []`), but it is the most expensive shape of the three and
+would roughly double the board leg if a board were enabled. Durham paces itself
+with `REQUEST_DELAY_SECONDS` (0.3s); the others do not throttle.
 
 Two things hold that number down, and both are worth keeping:
 `[watch] exclude_codes` removes a bottle's term from every board (the 17 codes
