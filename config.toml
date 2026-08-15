@@ -23,6 +23,30 @@ listing_types = ["Allocation", "Limited"]
 name_patterns = ["Pappy", "Van Winkle", "Antique Collection", "William Larue", "George T. Stagg"]
 # Alert when Total Available drops by this fraction between polls (boards ordering).
 drawdown_alert_fraction = 0.5
+# Bottles to drop from the watch universe regardless of what the state says.
+# The universe is derived — whatever NC flags Allocation/Limited, plus the whole
+# official allocated list — so it arrives full of things nobody here cares
+# about. Reviewed by hand 2026-08-14; these also stop being searched for on
+# every board poll.
+exclude_codes = [
+  "18152",  # 2XO Gem of Kentucky Single Barrel
+  "18482",  # 2XO Kiawah Blend
+  "18153",  # 2XO Sneakerhead Bourbon
+  "18566",  # Crown Royal Blackberry
+  "17724",  # Crown Royal Chocolate
+  "20233",  # Crown Royal Salted Caramel
+  "17192",  # Hard Truth Sweet Mash Wheated Bourbon BFR Mizunara
+  "18744",  # Hennessy White 25th Anniversary
+  "18953",  # High N' Wicked The Judge
+  "17712",  # Maker's Mark Cellar Aged
+  "18102",  # Maker's Mark Cellar Aged
+  "18764",  # Maker's Mark Cellar Aged
+  "17158",  # Maker's Mark Cellar Aged 2026
+  "19149",  # Maker's Mark Wood Finishing Series BRT-01
+  "19150",  # Maker's Mark Wood Finishing Series BRT-02
+  "17562",  # On Your Six USMC 250th Birthday Bourbon
+  "20886",  # Rebel Single Barrel 10 Year
+]
 
 [wake]
 enabled = true

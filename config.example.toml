@@ -28,6 +28,15 @@ listing_types = ["Allocation", "Limited"]
 name_patterns = ["Pappy", "Van Winkle", "Antique Collection", "William Larue", "George T. Stagg"]
 # Alert when Total Available drops by this fraction between polls (boards ordering).
 drawdown_alert_fraction = 0.5
+# NC codes to drop from the watch universe, whatever the state says about them.
+# Everything else here widens the net; this is the only knob that narrows it.
+# The universe is DERIVED — whatever NC currently flags Allocation/Limited plus
+# the state's entire official allocated list — so it arrives carrying tequila,
+# cognac and flavoured Canadian whisky alongside the bourbon. Excluding a code
+# removes it from the page, the report AND the per-board search terms, so this
+# is also how you reduce the number of requests each board poll makes.
+# Dashed ("18-152") and dashless ("18152") both work.
+exclude_codes = []
 
 [wake]
 enabled = true

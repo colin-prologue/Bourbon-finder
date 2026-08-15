@@ -7,9 +7,17 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+
+
+def _nc_code(code) -> str:
+    """'18-152' -> '18152'. Same rule as `sources.catalog.normalize_nc_code`,
+    duplicated rather than imported: that module pulls in BeautifulSoup and the
+    HTTP layer, and config has no business depending on either."""
+    return re.sub(r"[^0-9]", "", str(code or ""))
 
 
 @dataclass
@@ -35,6 +43,17 @@ class WatchConfig:
     listing_types: list[str] = field(default_factory=lambda: ["Allocation", "Limited"])
     name_patterns: list[str] = field(default_factory=list)
     drawdown_alert_fraction: float = 0.5
+    # NC codes to drop from the watch universe, whatever the state says about
+    # them. Everything else here widens the net — these are the only knob that
+    # narrows it.
+    #
+    # This exists because the universe is DERIVED, not chosen: it is whatever NC
+    # currently flags Allocation/Limited plus the state's whole allocated list,
+    # which is how tequila and flavoured Crown Royal ended up on a bourbon
+    # watchlist. Excluding a code removes it from the page, from the report, and
+    # from the search terms sent to the boards — so this also shrinks the number
+    # of requests each board poll makes.
+    exclude_codes: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -135,6 +154,12 @@ def load_config(path: str | None = None) -> Config:
         listing_types=list(w.get("listing_types", ["Allocation", "Limited"])),
         name_patterns=list(w.get("name_patterns", [])),
         drawdown_alert_fraction=w.get("drawdown_alert_fraction", 0.5),
+        # Normalised on the way in. NC codes appear dashed (`18-152`) on pricing
+        # pages and dashless (`18152`) in the stock report and Wake PLUs, and a
+        # code pasted from the wrong page would otherwise match nothing and
+        # silently exclude nothing — a config typo that fails open is worse than
+        # one that errors, because nobody goes looking.
+        exclude_codes={_nc_code(c) for c in w.get("exclude_codes", []) if _nc_code(c)},
     )
     wk = data.get("wake", {})
     cfg.wake = WakeConfig(

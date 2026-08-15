@@ -18,7 +18,7 @@ stages:
 
 | Loop | Source | Cadence | What it catches |
 |---|---|---|---|
-| `poll-stocks` | Warehouse Stock Report (`abc2.nc.gov/StoresBoards/Stocks`) | every 15–20 min | **Stage A (radar):** Allocation/Limited items appearing in state stock; drawdowns as boards order |
+| `poll-stocks` | Warehouse Stock Report (`abc2.nc.gov/StoresBoards/Stocks`) | every 2h | **Stage A (radar):** Allocation/Limited items appearing in state stock; drawdowns as boards order |
 | `poll-boards` | Per-store board sites: Durham + Greensboro (in range of Hillsborough) | 2–4×/day | **Stage B (confirmation):** which shelf a rare bottle is on right now — emits `board_restock` |
 | `poll-wake` | Wake ABC store search (`wakeabc.com`) | 2–4×/day | store-level Wake restocks with addresses and quantities (separate legacy Wake path) |
 | `poll-catalog` | Special Items, New Items, allocated-list xlsx | daily | new NC Codes entering the system (~1 month early) |
@@ -50,7 +50,10 @@ for the page:
 - **Store everything, surface little.** Every row a source returns is
   persisted — the report wants the whole inventory picture. Only codes in the
   watch universe (Allocation/Limited in the warehouse, plus the state's
-  official allocated list, plus `name_patterns` matches) count as events.
+  official allocated list, plus `name_patterns` matches, **minus
+  `[watch] exclude_codes`**) count as events. That universe is derived from
+  what the state publishes, so `exclude_codes` is the only place a human gets
+  to say "not this one" — and it is subtracted last, after every widening rule.
   Board search APIs match loosely: a bourbon watchlist pulled back 285
   Greensboro codes, 28 of which were actually allocated.
 - **One event per product, not per store.** A county delivery puts a bottle on
@@ -162,10 +165,21 @@ second poll of each source.
 ### Scheduling on your own box (recommended)
 
 ```cron
-*/20 * * * *  cd /path/to/nc-bourbon-finder && .venv/bin/python -m ncbourbon poll-stocks
+17 */2 * * *  cd /path/to/nc-bourbon-finder && .venv/bin/python -m ncbourbon poll-stocks
 15 8,12,17 * * *  cd /path/to/nc-bourbon-finder && { rc=0; .venv/bin/python -m ncbourbon poll-boards || rc=1; .venv/bin/python -m ncbourbon poll-wake || rc=1; exit $rc; }
 5 6 * * *  cd /path/to/nc-bourbon-finder && { rc=0; .venv/bin/python -m ncbourbon poll-catalog || rc=1; .venv/bin/python -m ncbourbon digest || rc=1; .venv/bin/python -m ncbourbon prune || rc=1; exit $rc; }
 ```
+
+**Two-hourly stocks, not every 20 minutes.** The state publishes the warehouse
+report as a *daily* artifact, so `warehouse_snapshot` keeps one row per code per
+report day — polling it 72×/day re-reads the same figure and stores it once.
+What a faster poll actually buys is a fresher `Total Available` for the drawdown
+signal, and drawdown is a trend over days, not minutes. The Actions workflow has
+a second reason (Actions throttles frequent schedules on public repos, and each
+poll commits the DB, which is the repo's size), but the politeness argument
+stands on its own and applies to a local install too. The source refreshes about
+every 15 minutes, so if you genuinely want a faster local cadence you have room
+— just don't take it by default.
 
 **Run each command, then report the worst — do not chain them with `&&`.** A
 poll command exits non-zero once a source has failed `HEALTH_ALERT_THRESHOLD`
@@ -208,11 +222,43 @@ These are public government pages presenting public records, and at least
 two third-party trackers poll them openly at the same cadence. Still, be a
 good citizen — the defaults already are:
 
-- Poll no faster than sources refresh (15 min stocks; ~2×/day Wake).
-- One bulk request per cycle (empty search returns the whole report).
+- Poll no faster than sources refresh (2-hourly stocks; ~2–4×/day boards).
 - Identifying User-Agent with contact email (set yours in config.toml).
-- Exponential backoff; after 4 consecutive failures the tool emails you and
-  the health record shows it — it never hammers a struggling server.
+- Exponential backoff; after 4 consecutive failures the tool emails you, fails
+  the run, and the health record shows it — it never hammers a struggling server.
+
+**What each loop actually costs**, because "be polite" is worth stating in
+requests rather than in adjectives:
+
+| Loop | Requests per run |
+|---|---|
+| `poll-stocks` | **1.** An empty search returns the whole warehouse report |
+| `poll-catalog` | **3.** Two price tables and the allocated xlsx |
+| `poll-wake` | one search per `[wake] search_terms` entry (10 by default) |
+| `poll-boards` → Durham | one search per term, **plus** one detail page per relevant code (ceiling `MAX_DETAIL_FETCHES`, 400) |
+| `poll-boards` → Greensboro | one search per term, **paginated** — 50 items per request, so a term matching more than 50 costs one request per extra page (guard `MAX_ITEMS`, 1000, i.e. up to 20) |
+| `poll-boards` → ABC/GO *(off by default)* | one search per term, **plus** one detail page per code found in stock, **plus** up to `MAX_RECHECK` (40) sellout re-checks |
+
+Only the first two are the "one bulk request" shape. The board leg is not, and
+saying otherwise would be flattering rather than accurate. Every board multiplies
+by the term count, which is derived from the live watchlist and moves on its own:
+as of 2026-08-14 it is **139 terms**, and Durham's last run fetched **211**
+detail pages. So a board poll is several hundred requests spread over a few
+minutes, four times a day.
+
+Note this is per *board*, not per run — the row costs stack, and two of the three
+have a second multiplier on top of the term count. ABC/GO contributes nothing
+today (`abcgo_boards = []`), but it is the most expensive shape of the three and
+would roughly double the board leg if a board were enabled. Durham paces itself
+with `REQUEST_DELAY_SECONDS` (0.3s); the others do not throttle.
+
+Two things hold that number down, and both are worth keeping:
+`[watch] exclude_codes` removes a bottle's term from every board (the 17 codes
+excluded on 2026-08-14 took 150 terms down to 139), and Durham's
+`MAX_DETAIL_FETCHES` is a runaway guard for the case where the derived list
+grows without anyone noticing. If this ever needs to come down further, the
+lever is fewer watched bottles, not a lower ceiling — a ceiling that binds is
+silent coverage loss, which is how Durham spent three weeks skipping 61 codes.
 
 ## Known quirks (from live testing)
 

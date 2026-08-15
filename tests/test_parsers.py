@@ -677,6 +677,100 @@ def test_partial_wake_run_does_not_seed():
     assert is_seeded(conn, "wake")
 
 
+def _exclusion_db():
+    """Two allocated bottles plus one flagged in the warehouse."""
+    from ncbourbon.db import connect
+    conn = connect(":memory:")
+    conn.execute("INSERT INTO allocated_list VALUES ('17724','Crown Royal Chocolate','','L')")
+    conn.execute("INSERT INTO allocated_list VALUES ('27090','Blantons Single Barrel','','L')")
+    conn.execute("INSERT INTO stock_latest VALUES ('17712',\"Maker's Mark Cellar Aged\",'Allocation',4,'x')")
+    conn.execute("INSERT INTO stock_latest VALUES ('19660',\"Maker's Mark 46\",'Allocation',9,'x')")
+    conn.commit()
+    return conn
+
+
+def test_an_excluded_code_leaves_every_surface_including_the_search_terms():
+    """Exclusion has to beat the derived universe on all of its exits.
+
+    The universe is derived — whatever NC flags Allocation/Limited plus the
+    whole official allocated list — so the only way to say "not this one" is for
+    the manual answer to win. Dropping it from `watch_codes` alone would leave
+    the board still being searched for it several times a day.
+    """
+    from ncbourbon.cli import _watchlist_terms
+    from ncbourbon.config import WatchConfig
+    from ncbourbon.diff import watch_codes
+
+    conn = _exclusion_db()
+    watch = WatchConfig(exclude_codes={"17724", "17712"})
+    assert watch_codes(conn, watch) == {"27090", "19660"}
+
+    terms = _watchlist_terms(conn, watch)
+    assert "Crown Royal" not in terms          # its only bottle was excluded
+    assert "Blantons Single" in terms
+    # A term is the first two words of a name, so it survives while ANY kept
+    # bottle shares it — excluding one Maker's Mark must not blind us to the other.
+    assert "Maker's Mark" in terms
+
+
+def test_exclusion_beats_a_name_pattern():
+    """A pattern is a widening rule, so it runs after the subtraction.
+
+    `watch_codes` subtracts, but both `alertable_codes` and
+    `pattern_matched_codes` then add codes back by matching product names — an
+    excluded bottle whose name happens to match a pattern would walk straight
+    back in through that door and reappear on the page.
+    """
+    from ncbourbon.config import WatchConfig
+    from ncbourbon.diff import alertable_codes, pattern_matched_codes
+    from ncbourbon.sources.abcgo import BoardStoreStock
+
+    conn = _exclusion_db()
+    watch = WatchConfig(name_patterns=["Crown Royal"], exclude_codes={"17724"})
+    rows = [BoardStoreStock("durham", "17724", "Crown Royal Chocolate", "$30", "s1", 3)]
+
+    assert "17724" not in alertable_codes(conn, watch, rows)
+    assert "17724" not in pattern_matched_codes(conn, watch)
+
+
+def test_excluded_codes_accept_the_dashed_form(tmp_path):
+    """NC codes are dashed on pricing pages and dashless everywhere else.
+
+    A code pasted from the wrong page would match nothing and silently exclude
+    nothing — a config typo that fails open, which is the kind nobody catches
+    because there is no error to see.
+    """
+    from ncbourbon.config import load_config
+
+    p = tmp_path / "c.toml"
+    p.write_text('[watch]\nexclude_codes = ["18-152", "18153", " 18482 "]\n')
+    assert load_config(str(p)).watch.exclude_codes == {"18152", "18153", "18482"}
+
+
+def test_an_excluded_bottle_disappears_from_the_report():
+    """The page is the product now, so this is the surface that matters."""
+    from ncbourbon.config import Config
+    from ncbourbon.diff import apply_board_snapshot
+    from ncbourbon.report import build_report
+    from ncbourbon.sources.abcgo import BoardStoreStock
+
+    conn = _exclusion_db()
+    apply_board_snapshot(conn, [
+        BoardStoreStock("greensboro", "17724", "Crown Royal Chocolate", "$30", "g1", 5),
+        BoardStoreStock("greensboro", "27090", "Blantons Single Barrel", "$65", "g1", 2),
+    ], complete={"greensboro"})
+
+    cfg = Config()
+    cfg.boards.abcgo_boards = []; cfg.boards.durham = False; cfg.wake.enabled = False
+    assert {i.nc_code for i in build_report(conn, cfg).shelf} == {"17724", "27090"}
+
+    cfg.watch.exclude_codes = {"17724"}
+    report = build_report(conn, cfg)
+    assert {i.nc_code for i in report.shelf} == {"27090"}
+    assert all(w.nc_code != "17724" for w in report.warehouse)
+    assert all(c.nc_code != "17724" for c in report.changes)
+
+
 def test_board_search_terms_cover_the_whole_watch_universe():
     """A board is only ever asked about products we name, so a gap between the
     universe and the search terms is a silent blind spot. The old

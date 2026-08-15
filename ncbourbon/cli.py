@@ -1,6 +1,6 @@
 """Command-line entry points.
 
-  python -m ncbourbon poll-stocks     # every 15 min  (state warehouse differ)
+  python -m ncbourbon poll-stocks     # every 2h (state warehouse differ)
   python -m ncbourbon poll-boards     # a few times/day (ABC/GO per-store board inventory)
   python -m ncbourbon poll-catalog    # daily (Special Items, new items, xlsx)
   python -m ncbourbon poll-wake       # 2-4x/day (Wake ABC store inventory)
@@ -164,13 +164,25 @@ def _watchlist_terms(conn, watch) -> list[str]:
             if len(literal) >= 3:      # shorter fragments match far too much
                 add(literal)
 
+    # Excluded codes contribute no term. This is the only place the exclusion
+    # list saves work rather than just hiding rows: a term is one search request
+    # per board per poll, so dropping a bottle nobody wants also stops asking
+    # every board about it several times a day.
+    #
+    # Note it is the CODE that is excluded and the TERM that is dropped, and a
+    # term is the first two words of a name — so a term survives if any kept
+    # bottle shares it. Excluding three of four Maker's Mark releases still
+    # searches "Maker's Mark" for the fourth, which is correct.
+    excluded = getattr(watch, "exclude_codes", set())
     for r in conn.execute(
-        "SELECT DISTINCT brand_name FROM stock_latest "
+        "SELECT DISTINCT nc_code, brand_name FROM stock_latest "
         "WHERE listing_type IN ('Allocation','Limited')"
     ):
-        add(r["brand_name"])
-    for r in conn.execute("SELECT DISTINCT product FROM allocated_list"):
-        add(r["product"])
+        if r["nc_code"] not in excluded:
+            add(r["brand_name"])
+    for r in conn.execute("SELECT DISTINCT nc_code, product FROM allocated_list"):
+        if r["nc_code"] not in excluded:
+            add(r["product"])
     for pattern in getattr(watch, "name_patterns", []):
         add_pattern(pattern)
     return sorted(terms)
