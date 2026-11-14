@@ -18,6 +18,7 @@ concurrency:
 jobs:
   pytest:
     runs-on: ubuntu-latest
+    timeout-minutes: 10   # a hung test fails the run instead of waiting six hours
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
